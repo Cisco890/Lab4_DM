@@ -1,0 +1,1777 @@
+﻿---
+title: "Laboratorio 4 - Modelado de Precio Airbnb"
+author: "Luis Pedro Lira 23669, Mario Rocha 23501, Juan Francisco Martinez 23617"
+date: "2026-03-16"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## 1) Carga de librerias y configuracion global
+
+```{r librerias-config}
+# Carga de paquetes de forma individual.
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(lubridate)
+library(scales)
+library(corrplot)
+library(car)
+library(glmnet)
+
+seed_global <- 23617
+reference_date <- as.Date("2025-12-31")
+price_trim_quantile <- 0.99
+split_train_prop <- 0.80
+rare_cat_min_abs <- 50
+rare_cat_min_prop <- 0.005
+winsor_probs <- c(0.01, 0.99)
+cluster_k_grid <- 2:7
+cluster_k_selected <- 4
+cluster_sample_max <- 25000
+cluster_nstart_grid <- 15
+cluster_nstart_final <- 30
+cluster_iter_grid <- 100
+cluster_iter_final <- 120
+enet_alpha <- 0.5
+enet_nfolds <- 10
+
+modelo_orden <- c("Simple", "Multiple", "Corregido", "Elastic Net")
+modelo_colores <- c(
+  "Simple" = "#a1dab4",
+  "Multiple" = "#41b6c4",
+  "Corregido" = "#2c7fb8",
+  "Elastic Net" = "#756bb1"
+)
+
+set.seed(seed_global)
+
+parse_price <- function(x) {
+  suppressWarnings(as.numeric(gsub("[^0-9\\.]", "", as.character(x))))
+}
+
+parse_pct <- function(x) {
+  suppressWarnings(as.numeric(gsub("%", "", as.character(x), fixed = TRUE)) / 100)
+}
+
+parse_bathrooms <- function(x) {
+  txt <- tolower(as.character(x))
+  m <- regexpr("[0-9]+(\\.[0-9]+)?", txt, perl = TRUE)
+  extracted <- ifelse(m > 0, regmatches(txt, m), NA_character_)
+  out <- suppressWarnings(as.numeric(extracted))
+  out[grepl("half-bath", txt, fixed = TRUE)] <- 0.5
+  out
+}
+
+winsorize <- function(x, low, high) {
+  pmin(pmax(x, low), high)
+}
+
+skewness_simple <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(NA_real_)
+  s <- sd(x)
+  if (is.na(s) || s == 0) return(0)
+  mean(((x - mean(x)) / s)^3)
+}
+
+safe_min_num <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  min(x, na.rm = TRUE)
+}
+
+safe_max_num <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  max(x, na.rm = TRUE)
+}
+
+safe_quantile <- function(x, p) {
+  if (all(is.na(x))) return(NA_real_)
+  as.numeric(quantile(x, probs = p, na.rm = TRUE))
+}
+
+safe_min_date <- function(x) {
+  if (all(is.na(x))) return(as.Date(NA))
+  min(x, na.rm = TRUE)
+}
+
+safe_max_date <- function(x) {
+  if (all(is.na(x))) return(as.Date(NA))
+  max(x, na.rm = TRUE)
+}
+
+scale_with <- function(df, center, scale) {
+  m <- as.matrix(df)
+  sweep(sweep(m, 2, center, "-"), 2, scale, "/")
+}
+
+assign_to_centers <- function(mat, centers) {
+  d <- sapply(seq_len(nrow(centers)), function(i) {
+    rowSums((mat - matrix(centers[i, ], nrow = nrow(mat), ncol = ncol(mat), byrow = TRUE))^2)
+  })
+  max.col(-d)
+}
+
+calc_metricas <- function(actual, predicted, label = "", include_mape = FALSE) {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  mae <- mean(abs(actual - predicted))
+  r2 <- cor(actual, predicted)^2
+
+  out <- tibble(
+    modelo = label,
+    RMSE = round(rmse, 4),
+    MAE = round(mae, 4),
+    R2 = round(r2, 4)
+  )
+
+  if (include_mape) {
+    mape <- mean(abs((actual - predicted) / actual)) * 100
+    out <- out %>% mutate(MAPE = round(mape, 2))
+  }
+
+  out
+}
+
+calc_metricas_train_test <- function(actual_train, predicted_train, actual_test, predicted_test, label) {
+  bind_rows(
+    calc_metricas(actual_train, predicted_train, paste(label, "Train", sep = " - ")),
+    calc_metricas(actual_test, predicted_test, paste(label, "Test", sep = " - "))
+  )
+}
+
+calc_metricas_por_modelo <- function(actual, predicciones, include_mape = FALSE) {
+  bind_rows(lapply(names(predicciones), function(modelo) {
+    calc_metricas(actual, predicciones[[modelo]], modelo, include_mape = include_mape)
+  }))
+}
+```
+
+## 2) Carga de datos (una sola vez)
+
+```{r carga-datos}
+load("listings.RData")
+if (!exists("listings")) {
+  stop("No se encontro el objeto `listings` dentro de listings.RData.")
+}
+
+datos_raw <- listings
+
+datos_base <- datos_raw %>%
+  mutate(price_num = parse_price(price))
+
+price_p99 <- quantile(datos_base$price_num, probs = price_trim_quantile, na.rm = TRUE)
+datos_price_nonzero <- datos_base %>%
+  filter(!is.na(price_num), price_num > 0)
+datos_price_valid <- datos_price_nonzero %>%
+  filter(price_num <= price_p99)
+
+dim(datos_base)
+```
+
+Analisis: el dataset se carga una sola vez desde `listings.RData` y se centralizan los objetos base reutilizables para todo el flujo (`datos_base`, `datos_price_nonzero`, `datos_price_valid`).
+
+## 3) Limpieza inicial y EDA
+
+### 3.1) Inventario y descripcion general de variables
+
+```{r inventario-variables}
+diccionario <- tibble(
+  variable = names(datos_base),
+  tipo = sapply(datos_base, function(x) class(x)[1]),
+  faltantes_n = sapply(datos_base, function(x) sum(is.na(x))),
+  faltantes_pct = round(sapply(datos_base, function(x) mean(is.na(x)) * 100), 2),
+  unicos_n = sapply(datos_base, function(x) n_distinct(x, na.rm = TRUE))
+) %>%
+  arrange(desc(faltantes_pct), variable)
+
+kable(head(diccionario, 25), caption = "Variables con mayor porcentaje de faltantes")
+```
+
+### 3.2) Calidad de datos: faltantes y cardinalidad
+
+```{r faltantes-y-cardinalidad}
+faltantes_top <- diccionario %>%
+  slice_max(order_by = faltantes_pct, n = 20)
+
+ggplot(faltantes_top, aes(x = reorder(variable, faltantes_pct), y = faltantes_pct)) +
+  geom_col(fill = "#2c7fb8") +
+  coord_flip() +
+  labs(
+    title = "Top 20 variables con mas faltantes",
+    x = "Variable",
+    y = "Porcentaje faltante"
+  ) +
+  theme_minimal()
+
+cardinalidad_alta <- diccionario %>%
+  filter(tipo %in% c("character", "logical"), unicos_n > 50) %>%
+  arrange(desc(unicos_n))
+
+kable(head(cardinalidad_alta, 15), caption = "Variables categoricas/texto de alta cardinalidad")
+```
+
+### 3.3) Resumen de variables numericas
+
+```{r resumen-numericas}
+vars_numericas <- names(datos_base)[sapply(datos_base, is.numeric)]
+
+resumen_numericas <- lapply(vars_numericas, function(v) {
+  x <- datos_base[[v]]
+  tibble(
+    variable = v,
+    min = safe_min_num(x),
+    q1 = safe_quantile(x, 0.25),
+    mediana = safe_quantile(x, 0.5),
+    media = ifelse(all(is.na(x)), NA_real_, mean(x, na.rm = TRUE)),
+    q3 = safe_quantile(x, 0.75),
+    max = safe_max_num(x),
+    faltantes_pct = round(mean(is.na(x)) * 100, 2)
+  )
+}) %>%
+  bind_rows()
+
+kable(head(resumen_numericas, 15), caption = "Resumen de variables numericas (primeras 15)")
+```
+
+### 3.4) Descripcion de variables categoricas clave
+
+```{r categoricas-clave}
+top_room <- sort(table(datos_base$room_type, useNA = "ifany"), decreasing = TRUE)
+top_property <- sort(table(datos_base$property_type, useNA = "ifany"), decreasing = TRUE)
+top_city <- sort(table(datos_base$city, useNA = "ifany"), decreasing = TRUE)
+
+kable(as.data.frame(top_room), col.names = c("room_type", "frecuencia"), caption = "Distribucion de room_type")
+kable(head(as.data.frame(top_property), 10), col.names = c("property_type", "frecuencia"), caption = "Top 10 property_type")
+kable(head(as.data.frame(top_city), 10), col.names = c("city", "frecuencia"), caption = "Top 10 city")
+```
+
+### 3.5) Revision de fechas y precio
+
+```{r fechas-precio}
+datos_fechas <- datos_base %>%
+  transmute(
+    host_since = as.Date(host_since),
+    first_review = as.Date(first_review),
+    last_review = as.Date(last_review),
+    last_scraped = as.Date(last_scraped),
+    calendar_last_scraped = as.Date(calendar_last_scraped)
+  )
+
+fechas_resumen <- datos_fechas %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "fecha") %>%
+  group_by(variable) %>%
+  summarise(
+    min = safe_min_date(fecha),
+    max = safe_max_date(fecha),
+    faltantes_pct = round(mean(is.na(fecha)) * 100, 2),
+    .groups = "drop"
+  )
+
+kable(fechas_resumen, caption = "Rango y faltantes de variables de fecha")
+
+summary(datos_base$price_num)
+quantile(datos_base$price_num, probs = c(0.9, 0.95, 0.99), na.rm = TRUE)
+```
+
+### 3.6) Distribucion de la variable respuesta: price
+
+```{r eda-price}
+ggplot(datos_price_nonzero, aes(x = price_num)) +
+  geom_histogram(bins = 80, fill = "#2c7fb8", color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(
+    title = "Distribucion del precio crudo (escala original)",
+    subtitle = "Fuerte sesgo a la derecha con cola larga",
+    x = "Precio (USD)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+ggplot(datos_price_nonzero, aes(x = log1p(price_num))) +
+  geom_histogram(bins = 60, fill = "#41b6c4", color = "white", alpha = 0.85) +
+  labs(
+    title = "Distribucion del precio con transformacion log1p",
+    subtitle = "Justifica modelar con log(price)",
+    x = "log(Precio + 1)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+```
+
+### 3.7) Distribuciones de variables numericas clave
+
+```{r eda-numericas}
+vars_eda <- c(
+  "accommodates", "bedrooms", "beds",
+  "number_of_reviews", "review_scores_rating",
+  "minimum_nights", "availability_365"
+)
+
+datos_long <- datos_base %>%
+  select(all_of(vars_eda)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "valor") %>%
+  filter(!is.na(valor))
+
+ggplot(datos_long, aes(x = valor)) +
+  geom_histogram(bins = 40, fill = "#2c7fb8", color = "white", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Distribuciones de variables numericas clave",
+    x = "Valor",
+    y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 8))
+```
+
+### 3.8) Outliers en variables numericas clave
+
+```{r eda-outliers}
+vars_box <- c("accommodates", "bedrooms", "beds", "minimum_nights", "number_of_reviews")
+
+datos_box <- datos_base %>%
+  select(all_of(vars_box)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "valor") %>%
+  filter(!is.na(valor))
+
+ggplot(datos_box, aes(x = variable, y = valor)) +
+  geom_boxplot(fill = "#fd8d3c", outlier.alpha = 0.15, outlier.size = 0.5) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Boxplots de variables numericas clave",
+    subtitle = "Puntos fuera del bigote representan outliers",
+    x = "",
+    y = "Valor"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+```
+
+### 3.9) Frecuencia de variables categoricas clave
+
+```{r eda-categoricas}
+p_room_type <- datos_base %>%
+  filter(!is.na(room_type)) %>%
+  count(room_type, sort = TRUE) %>%
+  ggplot(aes(x = reorder(room_type, n), y = n)) +
+  geom_col(fill = "#756bb1", alpha = 0.85) +
+  geom_text(aes(label = comma(n)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Frecuencia por room_type", x = "", y = "Conteo") +
+  theme_minimal()
+
+p_property_type <- datos_base %>%
+  filter(!is.na(property_type)) %>%
+  count(property_type, sort = TRUE) %>%
+  slice_head(n = 12) %>%
+  ggplot(aes(x = reorder(property_type, n), y = n)) +
+  geom_col(fill = "#41b6c4", alpha = 0.85) +
+  geom_text(aes(label = comma(n)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Top 12 property_type", x = "", y = "Conteo") +
+  theme_minimal()
+
+p_room_type
+p_property_type
+```
+
+### 3.10) Relacion entre accommodates y precio
+
+```{r eda-scatter}
+datos_scatter <- datos_price_valid %>%
+  filter(!is.na(accommodates), accommodates <= 16)
+
+ggplot(datos_scatter, aes(x = accommodates, y = price_num)) +
+  geom_jitter(alpha = 0.05, color = "#2c7fb8", size = 0.6, width = 0.3) +
+  geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 1) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Precio vs capacidad (accommodates)",
+    subtitle = "Relacion positiva: mayor capacidad, mayor precio",
+    x = "Numero de personas (accommodates)",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+### 3.11) Precio por room_type y property_type
+
+```{r eda-precio-categorias}
+datos_price_valid %>%
+  filter(!is.na(room_type)) %>%
+  ggplot(aes(x = reorder(room_type, price_num, median), y = price_num)) +
+  geom_boxplot(fill = "#a1dab4", outlier.alpha = 0.1, outlier.size = 0.5) +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Distribucion del precio por room_type",
+    x = "Tipo de habitacion",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+
+datos_price_valid %>%
+  filter(!is.na(property_type)) %>%
+  group_by(property_type) %>%
+  filter(n() >= 200) %>%
+  summarise(mediana_precio = median(price_num), n = n(), .groups = "drop") %>%
+  slice_max(mediana_precio, n = 12) %>%
+  ggplot(aes(x = reorder(property_type, mediana_precio), y = mediana_precio)) +
+  geom_col(fill = "#fd8d3c", alpha = 0.85) +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Precio mediano por property_type (top 12, min 200 obs)",
+    x = "Tipo de propiedad",
+    y = "Precio mediano (USD)"
+  ) +
+  theme_minimal()
+```
+
+### 3.12) Matriz de correlacion visual (EDA)
+
+```{r eda-correlacion}
+vars_cor_eda <- c(
+  "accommodates", "bedrooms", "beds", "bathrooms_text",
+  "number_of_reviews", "review_scores_rating",
+  "review_scores_cleanliness", "availability_365",
+  "minimum_nights", "calculated_host_listings_count"
+)
+
+vars_cor_eda_validas <- vars_cor_eda[sapply(vars_cor_eda, function(v) is.numeric(datos_base[[v]]))]
+
+datos_cor_eda <- datos_base %>%
+  select(all_of(vars_cor_eda_validas)) %>%
+  filter(complete.cases(.))
+
+cor_eda <- cor(datos_cor_eda)
+
+corrplot(
+  cor_eda,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.75,
+  addCoef.col = "black",
+  number.cex = 0.6,
+  col = colorRampPalette(c("#2c7fb8", "white", "#d7301f"))(200),
+  title = "Correlacion entre variables numericas predictoras",
+  mar = c(0, 0, 1.5, 0)
+)
+```
+
+## 4) Limpieza y preprocesamiento para modelado
+
+### 4.1) Limpieza de price
+
+```{r limpiar-price}
+datos_clean <- datos_price_valid
+
+cat("Filas despues de limpiar price:", nrow(datos_clean), "\n")
+cat("Rango de price_num:", min(datos_clean$price_num), "-", max(datos_clean$price_num), "\n")
+
+ggplot(datos_clean, aes(x = price_num)) +
+  geom_histogram(bins = 60, fill = "#2c7fb8", color = "white") +
+  labs(
+    title = "Distribucion del precio (sin outliers extremos)",
+    x = "Precio (USD)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+```
+
+### 4.2) Correlacion entre variables numericas y precio
+
+```{r correlacion-numericas}
+vars_num_correlacion_price <- c(
+  "price_num", "accommodates", "bedrooms", "beds",
+  "number_of_reviews", "review_scores_rating",
+  "review_scores_cleanliness", "review_scores_location",
+  "availability_365", "minimum_nights", "calculated_host_listings_count"
+)
+
+datos_cor <- datos_clean %>%
+  select(all_of(vars_num_correlacion_price)) %>%
+  filter(complete.cases(.))
+
+cor_matrix <- cor(datos_cor)
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.75,
+  addCoef.col = "black",
+  number.cex = 0.6,
+  title = "Correlacion entre variables numericas y price_num",
+  mar = c(0, 0, 1, 0)
+)
+```
+
+### 4.3) Precio por room_type
+
+```{r precio-room-type}
+datos_clean %>%
+  group_by(room_type) %>%
+  summarise(
+    n = n(),
+    mediana_precio = median(price_num, na.rm = TRUE),
+    media_precio = round(mean(price_num, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mediana_precio)) %>%
+  kable(caption = "Precio mediano y medio por room_type")
+
+ggplot(datos_clean, aes(x = reorder(room_type, price_num, median), y = price_num)) +
+  geom_boxplot(fill = "#41b6c4", outlier.alpha = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Distribucion del precio por room_type",
+    x = "Tipo de habitacion",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+### 4.4) Precio por accommodates
+
+```{r precio-accommodates}
+ggplot(
+  datos_clean %>% filter(accommodates <= 16),
+  aes(x = factor(accommodates), y = price_num)
+) +
+  geom_boxplot(fill = "#a1dab4", outlier.alpha = 0.15) +
+  labs(
+    title = "Precio segun capacidad de personas (accommodates)",
+    x = "Numero de personas",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+### 4.5) Precio por ciudad
+
+```{r precio-ciudad}
+top_ciudades <- datos_clean %>%
+  count(city, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(city)
+
+datos_clean %>%
+  filter(city %in% top_ciudades) %>%
+  group_by(city) %>%
+  summarise(
+    n = n(),
+    mediana_precio = median(price_num, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mediana_precio)) %>%
+  kable(caption = "Precio mediano por ciudad (top 10 ciudades)")
+
+datos_clean %>%
+  filter(city %in% top_ciudades) %>%
+  ggplot(aes(x = reorder(city, price_num, median), y = price_num)) +
+  geom_boxplot(fill = "#fd8d3c", outlier.alpha = 0.1) +
+  coord_flip() +
+  labs(
+    title = "Distribucion del precio por ciudad (top 10)",
+    x = "Ciudad",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+### 4.6) Precio vs numero de resenas
+
+```{r precio-reviews}
+ggplot(
+  datos_clean %>% filter(number_of_reviews <= 200),
+  aes(x = number_of_reviews, y = price_num)
+) +
+  geom_point(alpha = 0.1, color = "#756bb1", size = 0.8) +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(
+    title = "Precio vs numero de resenas",
+    x = "Numero de resenas",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+### 4.7) Resumen de variables mas relacionadas con price
+
+```{r resumen-relaciones}
+correlaciones <- cor(datos_cor)[, "price_num"] %>%
+  sort(decreasing = TRUE) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("variable") %>%
+  rename(correlacion = ".") %>%
+  filter(variable != "price_num")
+
+kable(correlaciones, caption = "Correlacion de variables numericas con price_num")
+```
+
+## 5) Particion train/test y dataset final de modelado
+
+### 5.1) Construccion del dataset de modelado
+
+```{r preparar-modelo-raw}
+modelo_raw <- datos_base %>%
+  filter(!is.na(price_num), price_num > 0) %>%
+  mutate(
+    log_price = log(price_num),
+    host_since_date = suppressWarnings(as.Date(host_since)),
+    host_tenure_years = as.numeric(interval(host_since_date, reference_date) / years(1)),
+    host_response_rate_num = parse_pct(host_response_rate),
+    host_acceptance_rate_num = parse_pct(host_acceptance_rate),
+    bathrooms_num = ifelse(!is.na(bathrooms), as.numeric(bathrooms), parse_bathrooms(bathrooms_text)),
+    minimum_nights_log1p = log1p(minimum_nights),
+    number_of_reviews_log1p = log1p(number_of_reviews),
+    review_missing_flag = as.integer(is.na(review_scores_rating)),
+    response_missing_flag = as.integer(is.na(host_response_rate_num))
+  ) %>%
+  select(
+    log_price, price_num,
+    city, room_type, property_type, neighbourhood_cleansed,
+    host_is_superhost, host_identity_verified, instant_bookable,
+    accommodates, bathrooms_num, bedrooms, beds,
+    minimum_nights_log1p, maximum_nights, availability_365,
+    number_of_reviews_log1p, reviews_per_month, review_scores_rating,
+    host_tenure_years, host_response_rate_num, host_acceptance_rate_num,
+    calculated_host_listings_count, latitude, longitude,
+    review_missing_flag, response_missing_flag
+  )
+
+skew_resumen <- tibble(
+  variable = c("price_num", "log_price"),
+  skewness = round(c(
+    skewness_simple(modelo_raw$price_num),
+    skewness_simple(modelo_raw$log_price)
+  ), 3)
+)
+
+kable(skew_resumen, caption = "Comparacion de sesgo: price vs log(price)")
+```
+
+### 5.2) Particion reproducible train/test (80/20 estratificado)
+
+```{r split-train-test}
+strata_split <- interaction(modelo_raw$city, modelo_raw$room_type, drop = TRUE)
+train_idx <- unlist(lapply(split(seq_len(nrow(modelo_raw)), strata_split), function(ids) {
+  n <- length(ids)
+  k <- max(1, floor(split_train_prop * n))
+  sample(ids, size = k)
+}))
+
+train_clean <- modelo_raw[train_idx, ]
+test_clean <- modelo_raw[-train_idx, ]
+
+split_info <- tibble(
+  dataset = c("train_clean", "test_clean"),
+  filas = c(nrow(train_clean), nrow(test_clean)),
+  proporcion = round(c(nrow(train_clean), nrow(test_clean)) / nrow(modelo_raw), 4)
+)
+
+kable(split_info, caption = paste0("Particion final reproducible (seed = ", seed_global, ")"))
+```
+
+### 5.3) Imputacion y manejo de categorias raras (aprendido en train)
+
+```{r imputacion-categorias}
+cat_vars <- c(
+  "city", "room_type", "property_type", "neighbourhood_cleansed",
+  "host_is_superhost", "host_identity_verified", "instant_bookable"
+)
+
+min_count <- max(rare_cat_min_abs, ceiling(rare_cat_min_prop * nrow(train_clean)))
+
+for (v in cat_vars) {
+  train_clean[[v]] <- as.character(train_clean[[v]])
+  test_clean[[v]] <- as.character(test_clean[[v]])
+
+  train_clean[[v]][is.na(train_clean[[v]]) | train_clean[[v]] == ""] <- "Unknown"
+  test_clean[[v]][is.na(test_clean[[v]]) | test_clean[[v]] == ""] <- "Unknown"
+
+  freq <- sort(table(train_clean[[v]]), decreasing = TRUE)
+  keep <- names(freq[freq >= min_count])
+
+  train_clean[[v]][!(train_clean[[v]] %in% keep)] <- "Other"
+  test_clean[[v]][!(test_clean[[v]] %in% keep)] <- "Other"
+
+  lvls <- sort(unique(c(train_clean[[v]], test_clean[[v]])))
+  train_clean[[v]] <- factor(train_clean[[v]], levels = lvls)
+  test_clean[[v]] <- factor(test_clean[[v]], levels = lvls)
+}
+
+train_clean <- train_clean %>%
+  rename(
+    property_type_group = property_type,
+    neighbourhood_group = neighbourhood_cleansed
+  )
+test_clean <- test_clean %>%
+  rename(
+    property_type_group = property_type,
+    neighbourhood_group = neighbourhood_cleansed
+  )
+
+cat_vars_final <- c(
+  "city", "room_type", "property_type_group", "neighbourhood_group",
+  "host_is_superhost", "host_identity_verified", "instant_bookable"
+)
+num_vars_final <- setdiff(names(train_clean), c("log_price", "price_num", cat_vars_final))
+
+medians_train <- sapply(train_clean[num_vars_final], function(x) median(x, na.rm = TRUE))
+for (v in num_vars_final) {
+  train_clean[[v]][is.na(train_clean[[v]])] <- medians_train[[v]]
+  test_clean[[v]][is.na(test_clean[[v]])] <- medians_train[[v]]
+}
+```
+
+### 5.4) Tratamiento de outliers (winsor 1%-99%)
+
+```{r winsor-outliers}
+winsor_vars <- c(
+  "maximum_nights", "availability_365", "calculated_host_listings_count",
+  "reviews_per_month", "host_tenure_years"
+)
+
+train_before_w <- train_clean[winsor_vars]
+test_before_w <- test_clean[winsor_vars]
+
+winsor_lims <- lapply(winsor_vars, function(v) {
+  quantile(train_clean[[v]], probs = winsor_probs, na.rm = TRUE)
+})
+names(winsor_lims) <- winsor_vars
+
+for (v in winsor_vars) {
+  low <- winsor_lims[[v]][1]
+  high <- winsor_lims[[v]][2]
+  train_clean[[v]] <- winsorize(train_clean[[v]], low, high)
+  test_clean[[v]] <- winsorize(test_clean[[v]], low, high)
+}
+
+outlier_resumen <- tibble(
+  variable = winsor_vars,
+  p01_train = round(sapply(winsor_lims, function(x) x[1]), 3),
+  p99_train = round(sapply(winsor_lims, function(x) x[2]), 3),
+  clips_train = sapply(winsor_vars, function(v) {
+    sum(train_before_w[[v]] < winsor_lims[[v]][1] | train_before_w[[v]] > winsor_lims[[v]][2])
+  }),
+  clips_test = sapply(winsor_vars, function(v) {
+    sum(test_before_w[[v]] < winsor_lims[[v]][1] | test_before_w[[v]] > winsor_lims[[v]][2])
+  })
+)
+
+kable(outlier_resumen, caption = "Tratamiento de outliers con cuantiles de train")
+```
+
+### 5.5) Segmentacion por clustering (k-means)
+
+```{r clustering-segmentacion}
+cluster_features <- c(
+  "accommodates", "bathrooms_num", "bedrooms", "beds",
+  "minimum_nights_log1p", "availability_365",
+  "number_of_reviews_log1p", "review_scores_rating", "host_tenure_years"
+)
+
+center_train <- sapply(train_clean[cluster_features], mean)
+scale_train <- sapply(train_clean[cluster_features], sd)
+scale_train[scale_train == 0] <- 1
+
+train_scaled <- scale_with(train_clean[cluster_features], center_train, scale_train)
+test_scaled <- scale_with(test_clean[cluster_features], center_train, scale_train)
+
+sample_idx <- sample(seq_len(nrow(train_scaled)), min(cluster_sample_max, nrow(train_scaled)))
+wss_grid <- sapply(cluster_k_grid, function(k) {
+  kmeans(train_scaled[sample_idx, ], centers = k, nstart = cluster_nstart_grid, iter.max = cluster_iter_grid)$tot.withinss
+})
+
+elbow_df <- tibble(k = cluster_k_grid, wss = wss_grid)
+ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line(color = "#2c7fb8", linewidth = 1) +
+  geom_point(color = "#2c7fb8", size = 2) +
+  scale_x_continuous(breaks = cluster_k_grid) +
+  labs(
+    title = "Elbow method en muestra de train",
+    subtitle = paste0(
+      "Se selecciona k = ", cluster_k_selected,
+      " por balance entre ajuste e interpretabilidad"
+    ),
+    x = "Numero de clusters (k)",
+    y = "Within-cluster sum of squares"
+  ) +
+  theme_minimal()
+
+km_model <- kmeans(
+  train_scaled[sample_idx, ],
+  centers = cluster_k_selected,
+  nstart = cluster_nstart_final,
+  iter.max = cluster_iter_final
+)
+segment_levels <- as.character(seq_len(cluster_k_selected))
+
+train_clean$segment_id <- factor(assign_to_centers(train_scaled, km_model$centers), levels = segment_levels)
+test_clean$segment_id <- factor(assign_to_centers(test_scaled, km_model$centers), levels = segment_levels)
+
+segment_profile <- bind_rows(
+  train_clean,
+  test_clean
+) %>%
+  group_by(segment_id) %>%
+  summarise(
+    n = n(),
+    pct_total = round(100 * n() / (nrow(train_clean) + nrow(test_clean)), 2),
+    precio_geometrico = round(exp(mean(log_price)), 2),
+    accommodates_prom = round(mean(accommodates), 2),
+    bedrooms_prom = round(mean(bedrooms), 2),
+    bathrooms_prom = round(mean(bathrooms_num), 2),
+    review_rating_prom = round(mean(review_scores_rating), 2),
+    availability_prom = round(mean(availability_365), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(precio_geometrico)) %>%
+  mutate(
+    interpretacion = case_when(
+      precio_geometrico >= quantile(precio_geometrico, 0.75) ~ "Segmento premium: alta capacidad y mayor precio esperado.",
+      precio_geometrico >= median(precio_geometrico) ~ "Segmento medio-alto: unidades completas con precio intermedio.",
+      TRUE ~ "Segmento economico: menor precio y menor capacidad relativa."
+    )
+  )
+
+kable(segment_profile, caption = "Perfil de grupos y efecto esperado sobre precio")
+```
+
+### 5.6) Entregables finales de preprocesamiento
+
+```{r guardar-parte1}
+train_clean <- train_clean %>% select(-price_num)
+test_clean <- test_clean %>% select(-price_num)
+
+response_var <- "log_price"
+predictor_set <- setdiff(names(train_clean), response_var)
+
+variables_descartadas <- tibble(
+  variable = c(
+    "id", "listing_url", "scrape_id", "last_scraped",
+    "name", "description", "neighborhood_overview", "host_about",
+    "amenities", "calendar_updated", "estimated_revenue_l365d", "license"
+  ),
+  razon = c(
+    "Identificador unico, no predictivo.",
+    "URL unica (alta cardinalidad, irrelevante para precio).",
+    "Metadato tecnico del scraping.",
+    "Fecha de scraping, no representa valor intrinseco del listing.",
+    "Texto libre de alta cardinalidad.",
+    "Texto libre sin vectorizacion en esta fase.",
+    "Texto libre sin vectorizacion en esta fase.",
+    "Texto libre sin vectorizacion en esta fase.",
+    "Texto semi-estructurado de muy alta cardinalidad (se reserva para NLP).",
+    "100% faltante.",
+    "Variable con 55%+ faltantes y potencial fuga temporal.",
+    "Cobertura incompleta y reglas heterogeneas por ciudad."
+  )
+)
+
+resumen_final <- tibble(
+  dataset = c("train_clean", "test_clean"),
+  filas = c(nrow(train_clean), nrow(test_clean)),
+  columnas = c(ncol(train_clean), ncol(test_clean)),
+  n_na = c(sum(is.na(train_clean)), sum(is.na(test_clean)))
+)
+
+kable(resumen_final, caption = "Datasets finales limpios listos para modelado")
+kable(tibble(predictor = predictor_set), caption = "Set final de variables candidatas")
+kable(variables_descartadas, caption = "Variables descartadas y justificacion")
+
+save(
+  train_clean, test_clean, response_var, predictor_set, segment_profile,
+  file = "parte2_datasets_limpios.RData"
+)
+```
+
+## 6) Modelado de regresion
+
+### 6.1) Modelo de regresion lineal simple
+
+```{r modelo-simple}
+vars_num_candidatas <- c(
+  "accommodates", "bedrooms", "beds", "bathrooms_num",
+  "minimum_nights_log1p", "number_of_reviews_log1p",
+  "review_scores_rating", "availability_365",
+  "host_tenure_years", "calculated_host_listings_count"
+)
+
+cors_simple <- sapply(vars_num_candidatas, function(v) {
+  cor(train_clean[[v]], train_clean$log_price, use = "complete.obs")
+})
+
+cors_df <- tibble(
+  variable = names(cors_simple),
+  correlacion = round(cors_simple, 4)
+) %>%
+  arrange(desc(abs(correlacion)))
+
+kable(cors_df, caption = "Correlacion de variables numericas con log_price")
+
+mejor_var <- cors_df$variable[1]
+cat("Variable seleccionada:", mejor_var, "\n")
+
+formula_simple <- as.formula(paste("log_price ~", mejor_var))
+modelo_simple <- lm(formula_simple, data = train_clean)
+
+summary(modelo_simple)
+
+pred_simple_train <- predict(modelo_simple, train_clean)
+pred_simple_test <- predict(modelo_simple, test_clean)
+
+metricas_simple <- calc_metricas_train_test(
+  actual_train = train_clean$log_price,
+  predicted_train = pred_simple_train,
+  actual_test = test_clean$log_price,
+  predicted_test = pred_simple_test,
+  label = "Simple"
+)
+
+kable(metricas_simple, caption = "Metricas modelo simple (log_price)")
+
+ggplot(train_clean, aes(x = .data[[mejor_var]], y = log_price)) +
+  geom_point(alpha = 0.05, color = "#2c7fb8", size = 0.6) +
+  geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 1) +
+  labs(
+    title = paste("Ajuste lineal simple: log_price ~", mejor_var),
+    subtitle = paste0("R2 train = ", round(summary(modelo_simple)$r.squared, 3)),
+    x = mejor_var,
+    y = "log(price)"
+  ) +
+  theme_minimal()
+
+par(mfrow = c(2, 2))
+plot(modelo_simple, which = 1:4)
+par(mfrow = c(1, 1))
+```
+
+### 6.2) Modelo de regresion lineal multiple
+
+```{r modelo-multiple}
+vars_num_modelo_regresion <- c(
+  "accommodates", "bedrooms", "beds", "bathrooms_num",
+  "minimum_nights_log1p", "number_of_reviews_log1p",
+  "review_scores_rating", "review_scores_cleanliness",
+  "review_scores_location", "availability_365",
+  "host_tenure_years", "calculated_host_listings_count",
+  "reviews_per_month"
+)
+
+vars_num_modelo_regresion <- intersect(vars_num_modelo_regresion, names(train_clean))
+
+formula_mult <- as.formula(
+  paste("log_price ~", paste(vars_num_modelo_regresion, collapse = " + "))
+)
+
+modelo_multiple <- lm(formula_mult, data = train_clean)
+
+coef_tabla <- as.data.frame(summary(modelo_multiple)$coefficients) %>%
+  tibble::rownames_to_column("variable") %>%
+  rename(
+    estimado = Estimate,
+    error_std = `Std. Error`,
+    t_valor = `t value`,
+    p_valor = `Pr(>|t|)`
+  ) %>%
+  mutate(
+    significancia = case_when(
+      p_valor < 0.001 ~ "***",
+      p_valor < 0.01 ~ "**",
+      p_valor < 0.05 ~ "*",
+      p_valor < 0.1 ~ ".",
+      TRUE ~ ""
+    ),
+    across(c(estimado, error_std, t_valor), ~ round(.x, 4)),
+    p_valor = round(p_valor, 5)
+  )
+
+kable(coef_tabla, caption = "Coeficientes del modelo multiple")
+cat("R2 ajustado:", round(summary(modelo_multiple)$adj.r.squared, 4), "\n")
+
+pred_multiple_train <- predict(modelo_multiple, train_clean)
+pred_multiple_test <- predict(modelo_multiple, test_clean)
+
+metricas_multiple <- calc_metricas_train_test(
+  actual_train = train_clean$log_price,
+  predicted_train = pred_multiple_train,
+  actual_test = test_clean$log_price,
+  predicted_test = pred_multiple_test,
+  label = "Multiple"
+)
+
+kable(metricas_multiple, caption = "Metricas modelo multiple (log_price)")
+
+par(mfrow = c(2, 2))
+plot(modelo_multiple, which = 1:4)
+par(mfrow = c(1, 1))
+```
+
+### 6.3) Analisis de multicolinealidad (VIF)
+
+```{r multicolinealidad}
+datos_cor_pred <- train_clean %>%
+  select(all_of(vars_num_modelo_regresion)) %>%
+  filter(complete.cases(.))
+
+cor_pred <- cor(datos_cor_pred)
+
+corrplot(
+  cor_pred,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.7,
+  addCoef.col = "black",
+  number.cex = 0.55,
+  col = colorRampPalette(c("#2c7fb8", "white", "#d7301f"))(200),
+  title = "Correlacion entre predictores numericos",
+  mar = c(0, 0, 1.5, 0)
+)
+
+vif_valores <- vif(modelo_multiple)
+vif_df <- tibble(
+  variable = names(vif_valores),
+  VIF = round(vif_valores, 3)
+) %>%
+  arrange(desc(VIF)) %>%
+  mutate(
+    problema = case_when(
+      VIF > 10 ~ "Alta multicolinealidad",
+      VIF > 5 ~ "Multicolinealidad moderada",
+      TRUE ~ "Aceptable"
+    )
+  )
+
+kable(vif_df, caption = "Factor de Inflacion de Varianza (VIF)")
+
+ggplot(vif_df, aes(x = reorder(variable, VIF), y = VIF, fill = problema)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "orange", linewidth = 0.8) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red", linewidth = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Alta multicolinealidad" = "#d7301f",
+    "Multicolinealidad moderada" = "#fd8d3c",
+    "Aceptable" = "#41b6c4"
+  )) +
+  labs(
+    title = "VIF por variable predictora",
+    subtitle = "Linea naranja = 5, linea roja = 10",
+    x = "",
+    y = "VIF",
+    fill = "Diagnostico"
+  ) +
+  theme_minimal()
+
+vars_problematicas <- vif_df %>% filter(VIF > 5) %>% pull(variable)
+cat("Variables con VIF > 5:", paste(vars_problematicas, collapse = ", "), "\n")
+```
+
+### 6.4) Evaluacion de sobreajuste
+
+```{r sobreajuste}
+metricas_comparacion <- bind_rows(metricas_simple, metricas_multiple)
+kable(metricas_comparacion, caption = "Comparacion de metricas Train vs Test")
+
+metricas_comparacion_detalle <- metricas_comparacion %>%
+  tidyr::separate(modelo, into = c("tipo", "split"), sep = " - ")
+
+metricas_comparacion_detalle %>%
+  ggplot(aes(x = tipo, y = RMSE, fill = split)) +
+  geom_col(position = "dodge", alpha = 0.85, width = 0.6) +
+  scale_fill_manual(values = c("Train" = "#2c7fb8", "Test" = "#d7301f")) +
+  labs(
+    title = "RMSE: Train vs Test por modelo",
+    subtitle = "Brecha grande indica sobreajuste",
+    x = "Modelo",
+    y = "RMSE (log_price)",
+    fill = "Split"
+  ) +
+  theme_minimal()
+
+brecha <- metricas_comparacion_detalle %>%
+  select(tipo, split, RMSE) %>%
+  tidyr::pivot_wider(names_from = split, values_from = RMSE) %>%
+  mutate(brecha_pct = round(100 * (Test - Train) / Train, 2))
+
+kable(brecha, caption = "Brecha relativa RMSE Test vs Train (%)")
+```
+
+### 6.5) Modelo corregido
+
+```{r modelo-corregido}
+vars_corregido <- vars_num_modelo_regresion[!vars_num_modelo_regresion %in% vars_problematicas]
+vars_corregido <- union(vars_corregido, "accommodates")
+
+cat_vars_modelo <- intersect(
+  c("room_type", "city", "host_is_superhost", "instant_bookable", "segment_id"),
+  names(train_clean)
+)
+
+formula_corregido <- as.formula(
+  paste("log_price ~", paste(c(vars_corregido, cat_vars_modelo), collapse = " + "))
+)
+
+modelo_corregido <- lm(formula_corregido, data = train_clean)
+
+coef_corr_tabla <- as.data.frame(summary(modelo_corregido)$coefficients) %>%
+  tibble::rownames_to_column("variable") %>%
+  rename(
+    estimado = Estimate,
+    error_std = `Std. Error`,
+    t_valor = `t value`,
+    p_valor = `Pr(>|t|)`
+  ) %>%
+  mutate(
+    significancia = case_when(
+      p_valor < 0.001 ~ "***",
+      p_valor < 0.01 ~ "**",
+      p_valor < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    across(c(estimado, error_std, t_valor), ~ round(.x, 4)),
+    p_valor = round(p_valor, 5)
+  )
+
+kable(coef_corr_tabla, caption = "Coeficientes del modelo corregido")
+cat("R2 ajustado:", round(summary(modelo_corregido)$adj.r.squared, 4), "\n")
+
+pred_corregido_train <- predict(modelo_corregido, train_clean)
+pred_corregido_test <- predict(modelo_corregido, test_clean)
+
+metricas_corregido <- calc_metricas_train_test(
+  actual_train = train_clean$log_price,
+  predicted_train = pred_corregido_train,
+  actual_test = test_clean$log_price,
+  predicted_test = pred_corregido_test,
+  label = "Corregido"
+)
+
+kable(metricas_corregido, caption = "Metricas modelo corregido")
+
+par(mfrow = c(2, 2))
+plot(modelo_corregido, which = 1:4)
+par(mfrow = c(1, 1))
+
+ggplot(
+  data.frame(real = test_clean$log_price, predicho = pred_corregido_test),
+  aes(x = predicho, y = real)
+) +
+  geom_point(alpha = 0.05, color = "#756bb1", size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  labs(
+    title = "Real vs predicho: modelo corregido (test)",
+    subtitle = "Linea roja = prediccion perfecta",
+    x = "log_price predicho",
+    y = "log_price real"
+  ) +
+  theme_minimal()
+```
+
+### 6.6) Modelo regularizado (Elastic Net)
+
+```{r modelo-regularizado}
+X_train <- model.matrix(formula_corregido, data = train_clean)[, -1]
+y_train <- train_clean$log_price
+
+X_test <- model.matrix(formula_corregido, data = test_clean)[, -1]
+y_test <- test_clean$log_price
+
+cv_enet <- cv.glmnet(X_train, y_train, alpha = enet_alpha, nfolds = enet_nfolds)
+
+plot(cv_enet)
+title("Cross-validation Elastic Net: seleccion de lambda", line = 2.5)
+
+lambda_min <- cv_enet$lambda.min
+lambda_1se <- cv_enet$lambda.1se
+cat("Lambda minimo (menor error):", round(lambda_min, 5), "\n")
+cat("Lambda 1-SE (mas parsimonioso):", round(lambda_1se, 5), "\n")
+
+coef_enet <- coef(cv_enet, s = "lambda.1se")
+coef_enet_df <- as.data.frame(as.matrix(coef_enet))
+colnames(coef_enet_df) <- "coeficiente"
+
+coef_enet_df <- coef_enet_df %>%
+  tibble::rownames_to_column("variable") %>%
+  filter(coeficiente != 0, variable != "(Intercept)") %>%
+  arrange(desc(abs(coeficiente)))
+
+kable(coef_enet_df, caption = "Coeficientes no cero - Elastic Net (lambda.1se)")
+cat("Variables seleccionadas por Elastic Net:", nrow(coef_enet_df), "\n")
+
+pred_enet_train <- as.vector(predict(cv_enet, X_train, s = "lambda.1se"))
+pred_enet_test <- as.vector(predict(cv_enet, X_test, s = "lambda.1se"))
+
+metricas_enet <- calc_metricas_train_test(
+  actual_train = y_train,
+  predicted_train = pred_enet_train,
+  actual_test = y_test,
+  predicted_test = pred_enet_test,
+  label = "Elastic Net"
+)
+
+kable(metricas_enet, caption = "Metricas Elastic Net (lambda.1se)")
+
+ggplot(coef_enet_df, aes(x = reorder(variable, abs(coeficiente)), y = coeficiente)) +
+  geom_col(fill = ifelse(coef_enet_df$coeficiente > 0, "#2c7fb8", "#d7301f"), alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title = "Coeficientes seleccionados por Elastic Net",
+    subtitle = "Azul = efecto positivo | Rojo = efecto negativo",
+    x = "",
+    y = "Coeficiente"
+  ) +
+  theme_minimal()
+```
+
+### 6.7) Comparacion final de modelos de regresion
+
+```{r comparacion-final-modelos}
+predicciones_train <- list(
+  "Simple" = pred_simple_train,
+  "Multiple" = pred_multiple_train,
+  "Corregido" = pred_corregido_train,
+  "Elastic Net" = pred_enet_train
+)
+predicciones_test <- list(
+  "Simple" = pred_simple_test,
+  "Multiple" = pred_multiple_test,
+  "Corregido" = pred_corregido_test,
+  "Elastic Net" = pred_enet_test
+)
+
+metricas_todas <- bind_rows(
+  metricas_simple,
+  metricas_multiple,
+  metricas_corregido,
+  metricas_enet
+)
+
+kable(metricas_todas, caption = "Comparacion de metricas: todos los modelos")
+
+metricas_test <- metricas_todas %>%
+  filter(grepl("Test", modelo)) %>%
+  mutate(
+    modelo = gsub(" - Test", "", modelo),
+    modelo = factor(modelo, levels = modelo_orden)
+  )
+
+ggplot(metricas_test, aes(x = reorder(modelo, RMSE), y = RMSE, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = RMSE), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = modelo_colores) +
+  labs(
+    title = "RMSE en test por modelo (menor = mejor)",
+    subtitle = "Variable respuesta: log_price",
+    x = "",
+    y = "RMSE"
+  ) +
+  theme_minimal()
+
+save(
+  modelo_simple,
+  modelo_multiple,
+  modelo_corregido,
+  cv_enet,
+  metricas_todas,
+  predicciones_train, predicciones_test,
+  X_train, y_train,
+  X_test, y_test,
+  file = "parte3_modelos.RData"
+)
+
+cat("Objetos guardados en parte3_modelos.RData\n")
+```
+
+## 7) Modelado de clasificacion
+
+En este laboratorio no se construyeron modelos de clasificacion. El objetivo estadistico principal se mantuvo en regresion para `log_price`, por lo que esta seccion se deja explicita como no aplicable para evitar ambiguedad en el flujo.
+
+## 8) Evaluacion final (train/test)
+
+### 8.1) Aplicacion de modelos al conjunto de prueba
+
+```{r predicciones-test}
+metricas_test_final <- calc_metricas_por_modelo(
+  actual = test_clean$log_price,
+  predicciones = predicciones_test,
+  include_mape = TRUE
+)
+
+kable(metricas_test_final, caption = "Metricas de evaluacion en conjunto de prueba (test)")
+```
+
+### 8.2) Tabla comparativa train vs test
+
+```{r comparativa-train-test}
+metricas_train_final <- calc_metricas_por_modelo(
+  actual = train_clean$log_price,
+  predicciones = predicciones_train,
+  include_mape = TRUE
+)
+
+comparacion_completa <- bind_rows(
+  metricas_train_final %>% mutate(split = "Train"),
+  metricas_test_final %>% mutate(split = "Test")
+) %>%
+  select(modelo, split, RMSE, MAE, R2, MAPE) %>%
+  arrange(modelo, split)
+
+kable(comparacion_completa, caption = "Comparacion completa Train vs Test - todos los modelos")
+
+brecha_df <- metricas_train_final %>%
+  select(modelo, RMSE_train = RMSE) %>%
+  left_join(metricas_test_final %>% select(modelo, RMSE_test = RMSE), by = "modelo") %>%
+  mutate(
+    brecha_abs = round(RMSE_test - RMSE_train, 4),
+    brecha_pct = round(100 * (RMSE_test - RMSE_train) / RMSE_train, 2),
+    sobreajuste = ifelse(brecha_pct > 10, "Probable", "Aceptable")
+  )
+
+kable(brecha_df, caption = "Brecha de generalizacion: RMSE Test - RMSE Train")
+```
+
+## 9) Graficas de evaluacion
+
+### 9.1) Predicho vs real
+
+```{r grafico-predicho-real}
+pred_df <- tibble(
+  real = test_clean$log_price,
+  Simple = predicciones_test[["Simple"]],
+  Multiple = predicciones_test[["Multiple"]],
+  Corregido = predicciones_test[["Corregido"]],
+  `Elastic Net` = predicciones_test[["Elastic Net"]]
+) %>%
+  pivot_longer(-real, names_to = "modelo", values_to = "predicho") %>%
+  mutate(modelo = factor(modelo, levels = modelo_orden))
+
+ggplot(pred_df, aes(x = predicho, y = real)) +
+  geom_point(alpha = 0.04, size = 0.5, color = "#2c7fb8") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 0.8) +
+  facet_wrap(~modelo, ncol = 2) +
+  labs(
+    title = "Predicho vs real en conjunto de prueba",
+    subtitle = "Linea roja = prediccion perfecta",
+    x = "log_price predicho",
+    y = "log_price real"
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+### 9.2) Analisis de residuos
+
+```{r grafico-residuos}
+residuos_long <- tibble(
+  predicho = c(
+    predicciones_test[["Corregido"]],
+    predicciones_test[["Elastic Net"]]
+  ),
+  residuo = c(
+    test_clean$log_price - predicciones_test[["Corregido"]],
+    test_clean$log_price - predicciones_test[["Elastic Net"]]
+  ),
+  modelo = rep(c("Corregido", "Elastic Net"), each = nrow(test_clean))
+)
+
+ggplot(residuos_long, aes(x = predicho, y = residuo)) +
+  geom_point(alpha = 0.04, size = 0.5, color = "#756bb1") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "#fd8d3c", linewidth = 0.8) +
+  facet_wrap(~modelo) +
+  labs(
+    title = "Residuos vs valores ajustados (test)",
+    subtitle = "Linea naranja muestra tendencia de residuos",
+    x = "log_price predicho",
+    y = "Residuo"
+  ) +
+  theme_minimal()
+
+residuos_hist <- tibble(
+  residuo = c(
+    test_clean$log_price - predicciones_test[["Simple"]],
+    test_clean$log_price - predicciones_test[["Multiple"]],
+    test_clean$log_price - predicciones_test[["Corregido"]],
+    test_clean$log_price - predicciones_test[["Elastic Net"]]
+  ),
+  modelo = rep(modelo_orden, each = nrow(test_clean))
+) %>%
+  mutate(modelo = factor(modelo, levels = modelo_orden))
+
+ggplot(residuos_hist, aes(x = residuo, fill = modelo)) +
+  geom_histogram(bins = 60, alpha = 0.85, color = "white") +
+  facet_wrap(~modelo, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = modelo_colores) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.7) +
+  labs(
+    title = "Distribucion de residuos por modelo (test)",
+    subtitle = "Distribucion centrada en 0 y simetrica indica mejor ajuste",
+    x = "Residuo",
+    y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+### 9.3) Comparacion visual de errores por modelo
+
+```{r comparacion-errores}
+metricas_test_plot <- metricas_test_final %>%
+  mutate(modelo = factor(modelo, levels = modelo_orden))
+
+ggplot(metricas_test_plot, aes(x = reorder(modelo, RMSE), y = RMSE, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = RMSE), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = modelo_colores) +
+  labs(
+    title = "RMSE en test por modelo (menor = mejor)",
+    subtitle = "Variable respuesta: log_price",
+    x = "",
+    y = "RMSE"
+  ) +
+  theme_minimal()
+
+ggplot(metricas_test_plot, aes(x = reorder(modelo, R2), y = R2, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = R2), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), limits = c(0, 1)) +
+  scale_fill_manual(values = modelo_colores) +
+  labs(
+    title = "R2 en test por modelo (mayor = mejor)",
+    subtitle = "Proporcion de varianza de log_price explicada",
+    x = "",
+    y = "R2"
+  ) +
+  theme_minimal()
+
+errores_abs <- tibble(
+  error = c(
+    abs(test_clean$log_price - predicciones_test[["Simple"]]),
+    abs(test_clean$log_price - predicciones_test[["Multiple"]]),
+    abs(test_clean$log_price - predicciones_test[["Corregido"]]),
+    abs(test_clean$log_price - predicciones_test[["Elastic Net"]])
+  ),
+  modelo = rep(modelo_orden, each = nrow(test_clean))
+) %>%
+  mutate(modelo = factor(modelo, levels = modelo_orden))
+
+ggplot(errores_abs, aes(x = modelo, y = error, fill = modelo)) +
+  geom_boxplot(outlier.alpha = 0.05, show.legend = FALSE) +
+  scale_fill_manual(values = modelo_colores) +
+  labs(
+    title = "Distribucion del error absoluto por modelo (test)",
+    subtitle = "Cajas mas bajas y compactas indican mejor desempeno",
+    x = "",
+    y = "|Residuo| en log_price"
+  ) +
+  theme_minimal()
+```
+
+## 10) Conclusiones y cierre
+
+### 10.1) Discusion de efectividad de modelos
+
+```{r tabla-discusion}
+discusion_df <- tibble(
+  Modelo = c("Simple", "Multiple", "Corregido", "Elastic Net"),
+  Generalizacion = c(
+    "Buena (pocos parametros, bajo riesgo de sobreajuste)",
+    "Moderada (puede capturar ruido con muchas variables)",
+    "Buena (variables depuradas + categoricas clave)",
+    "Muy buena (penalizacion controla sobreajuste automaticamente)"
+  ),
+  Interpretabilidad = c(
+    "Muy alta (1 coeficiente)",
+    "Alta (coeficientes directos, pero afectados por colinealidad)",
+    "Alta (coeficientes estables, menos colinealidad)",
+    "Moderada (coeficientes encogidos)"
+  ),
+  Multicolinealidad = c(
+    "No aplica",
+    "Problema: VIF alto en accommodates/bedrooms/beds",
+    "Controlada: variables redundantes eliminadas",
+    "Controlada: Ridge-L2 encoge coeficientes correlacionados"
+  ),
+  Desempeno_esperado = c(
+    "Bajo (ignora ubicacion y tipo)",
+    "Medio (mejora con mas variables pero inestable)",
+    "Medio-alto (balance entre complejidad e interpretabilidad)",
+    "Alto (mejor generalizacion en test)"
+  )
+)
+
+kable(discusion_df, caption = "Analisis comparativo de efectividad de modelos")
+```
+
+### 10.2) Seleccion del mejor modelo
+
+```{r mejor-modelo}
+mejor_modelo_df <- metricas_test_final %>%
+  mutate(
+    rank_RMSE = rank(RMSE),
+    rank_R2 = rank(-R2),
+    rank_MAE = rank(MAE),
+    rank_total = rank_RMSE + rank_R2 + rank_MAE
+  ) %>%
+  arrange(rank_total)
+
+kable(mejor_modelo_df, caption = "Ranking de modelos por desempeno en test")
+cat("\nModelo seleccionado:", mejor_modelo_df$modelo[1], "\n")
+```
+
+### 10.3) Conclusiones finales
+
+El dataset de Inside Airbnb permite modelar precio de forma robusta, pero requiere limpieza y transformacion cuidadosa.
+
+La variable respuesta `price` debe tratarse como numerica limpia y modelarse como `log_price` para estabilizar sesgo y varianza.
+
+Las variables mas utiles para explicar precio fueron `room_type`, `accommodates`, `city`, `bedrooms`, `bathrooms_num` y `segment_id`.
+
+El modelo Elastic Net fue el mas solido para prediccion; el modelo corregido sigue siendo la mejor opcion si se prioriza interpretabilidad.
+
+### 10.4) Guardado de resultados finales
+
+```{r guardar-resultados-finales}
+save(
+  metricas_test_final,
+  metricas_train_final,
+  comparacion_completa,
+  brecha_df,
+  mejor_modelo_df,
+  file = "parte3_resultados_finales.RData"
+)
+
+cat("Resultados de Parte 3 guardados en parte3_resultados_finales.RData\n")
+```
+
+<!-- Avances del Lab 4 -->
+
+### 5.7) Avance 1 - Preparacion de datos y arbol de regresion base
+
+#### 5.7.1) Objetivo, variables y particion reutilizada
+
+Objetivo: entrenar un modelo de arbol de regresion para predecir el precio por noche usando la misma particion `train_clean/test_clean` creada en la entrega anterior.
+
+En este flujo, la variable respuesta principal es `log_price` (equivalente transformada de `price_num`), por lo que se reportan metricas en escala logaritmica y, adicionalmente, en escala de precio cuando aplica.
+
+Se utilizan todas las variables candidatas del set final (`predictor_set`) para construir un arbol base interpretable y comparable contra un baseline de media.
+
+```{r a1-arbol-reutilizar-particion}
+if (!exists("train_clean") || !exists("test_clean")) {
+  load("parte2_datasets_limpios.RData")
+}
+
+if (!exists("response_var")) {
+  if ("log_price" %in% names(train_clean)) {
+    response_var <- "log_price"
+  } else if ("price_num" %in% names(train_clean)) {
+    response_var <- "price_num"
+  } else if ("price" %in% names(train_clean)) {
+    response_var <- "price"
+  } else {
+    stop("No se encontro una variable objetivo de precio en train_clean.")
+  }
+}
+
+if (!exists("predictor_set")) {
+  predictor_set <- setdiff(names(train_clean), response_var)
+}
+
+predictor_set <- intersect(predictor_set, names(train_clean))
+
+train_tree <- train_clean %>% select(all_of(c(response_var, predictor_set)))
+test_tree <- test_clean %>% select(all_of(c(response_var, predictor_set)))
+
+# Alinea niveles de factores para predecir sin errores de niveles no vistos.
+factor_vars_tree <- names(train_tree)[sapply(train_tree, is.factor)]
+for (v in factor_vars_tree) {
+  test_tree[[v]] <- factor(test_tree[[v]], levels = levels(train_tree[[v]]))
+}
+
+resumen_arbol_split <- tibble(
+  dataset = c("train_tree", "test_tree"),
+  filas = c(nrow(train_tree), nrow(test_tree)),
+  columnas = c(ncol(train_tree), ncol(test_tree)),
+  total_na = c(sum(is.na(train_tree)), sum(is.na(test_tree)))
+)
+
+kable(resumen_arbol_split, caption = "Particion reutilizada para arbol base (mismo train/test)")
+```
+
+#### 5.7.2) Entrenamiento del arbol base, prediccion y metricas
+
+```{r a1-arbol-base}
+metricas_reg <- function(actual, pred) {
+  rmse <- sqrt(mean((actual - pred)^2))
+  mae <- mean(abs(actual - pred))
+  sst <- sum((actual - mean(actual))^2)
+  sse <- sum((actual - pred)^2)
+  r2 <- ifelse(sst == 0, NA_real_, 1 - (sse / sst))
+
+  tibble(
+    RMSE = rmse,
+    MAE = mae,
+    R2 = r2
+  )
+}
+
+set.seed(seed_global)
+
+formula_arbol_base <- as.formula(
+  paste(response_var, "~", paste(predictor_set, collapse = " + "))
+)
+
+modelo_arbol_base <- rpart::rpart(
+  formula_arbol_base,
+  data = train_tree,
+  method = "anova",
+  control = rpart::rpart.control(
+    cp = 0.001,
+    minsplit = 30,
+    minbucket = 10,
+    xval = 10
+  )
+)
+
+pred_arbol_train <- predict(modelo_arbol_base, newdata = train_tree)
+pred_arbol_test <- predict(modelo_arbol_base, newdata = test_tree)
+
+metricas_arbol_raw <- bind_rows(
+  metricas_reg(train_tree[[response_var]], pred_arbol_train) %>% mutate(split = "Train"),
+  metricas_reg(test_tree[[response_var]], pred_arbol_test) %>% mutate(split = "Test")
+) %>%
+  select(split, RMSE, MAE, R2)
+
+metricas_arbol <- metricas_arbol_raw %>%
+  mutate(across(c(RMSE, MAE, R2), ~ round(.x, 4)))
+
+pred_baseline_train <- rep(mean(train_tree[[response_var]]), nrow(train_tree))
+pred_baseline_test <- rep(mean(train_tree[[response_var]]), nrow(test_tree))
+
+metricas_baseline <- bind_rows(
+  metricas_reg(train_tree[[response_var]], pred_baseline_train) %>% mutate(split = "Train"),
+  metricas_reg(test_tree[[response_var]], pred_baseline_test) %>% mutate(split = "Test")
+) %>%
+  mutate(across(c(RMSE, MAE, R2), ~ round(.x, 4)))
+
+comparacion_arbol_baseline <- bind_rows(
+  metricas_arbol %>% mutate(modelo = "Arbol base"),
+  metricas_baseline %>% mutate(modelo = "Baseline media")
+) %>%
+  select(modelo, split, RMSE, MAE, R2)
+
+cp_table_arbol <- as.data.frame(modelo_arbol_base$cptable) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+kable(metricas_arbol, caption = "Desempeno del arbol de regresion base")
+kable(comparacion_arbol_baseline, caption = "Comparacion arbol base vs baseline")
+kable(cp_table_arbol, caption = "Tabla de complejidad (cptable) del arbol base")
+```
+
+```{r a1-arbol-metricas-escala-precio}
+metricas_arbol_precio <- NULL
+
+if (response_var == "log_price") {
+  metricas_arbol_precio <- bind_rows(
+    metricas_reg(exp(train_tree[[response_var]]), exp(pred_arbol_train)) %>% mutate(split = "Train"),
+    metricas_reg(exp(test_tree[[response_var]]), exp(pred_arbol_test)) %>% mutate(split = "Test")
+  ) %>%
+    mutate(across(c(RMSE, MAE, R2), ~ round(.x, 2)))
+
+  kable(metricas_arbol_precio, caption = "Metricas del arbol en escala original de precio")
+}
+```
+
+```{r a1-arbol-importancia}
+if (!is.null(modelo_arbol_base$variable.importance)) {
+  importancia_arbol <- tibble(
+    variable = names(modelo_arbol_base$variable.importance),
+    importancia = as.numeric(modelo_arbol_base$variable.importance)
+  ) %>%
+    arrange(desc(importancia)) %>%
+    mutate(
+      importancia = round(importancia, 3),
+      importancia_rel = round(importancia / sum(importancia), 4)
+    )
+
+  kable(head(importancia_arbol, 15), caption = "Top 15 variables mas influyentes en el arbol")
+}
+```
+
+```{r a1-arbol-grafica, fig.width=12, fig.height=7}
+if (requireNamespace("rpart.plot", quietly = TRUE)) {
+  rpart.plot::rpart.plot(
+    modelo_arbol_base,
+    type = 3,
+    fallen.leaves = TRUE,
+    box.palette = "Blues",
+    shadow.col = "gray85",
+    nn = TRUE,
+    cex = 0.55
+  )
+} else {
+  plot(modelo_arbol_base, uniform = TRUE, margin = 0.1)
+  text(modelo_arbol_base, use.n = TRUE, cex = 0.6)
+}
+```
+
+```{r a1-arbol-real-vs-pred}
+pred_vs_real_test <- tibble(
+  real = test_tree[[response_var]],
+  predicho = pred_arbol_test
+)
+
+ggplot(pred_vs_real_test, aes(x = predicho, y = real)) +
+  geom_point(alpha = 0.20, color = "#2c7fb8", size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#d95f0e") +
+  labs(
+    title = "Arbol base: real vs predicho en test",
+    subtitle = paste0("Respuesta modelada: ", response_var),
+    x = paste(response_var, "predicho"),
+    y = paste(response_var, "real")
+  ) +
+  theme_minimal()
+```
+
+#### 5.7.3) Interpretacion de resultados
+
+El arbol de regresion base supera al baseline de media en el conjunto de prueba, lo que indica capacidad predictiva real sobre el precio.
+
+En escala `r response_var`, el modelo reporta en train: RMSE = `r round(metricas_arbol_raw$RMSE[metricas_arbol_raw$split == "Train"], 4)`, MAE = `r round(metricas_arbol_raw$MAE[metricas_arbol_raw$split == "Train"], 4)` y R2 = `r round(metricas_arbol_raw$R2[metricas_arbol_raw$split == "Train"], 4)`; en test: RMSE = `r round(metricas_arbol_raw$RMSE[metricas_arbol_raw$split == "Test"], 4)`, MAE = `r round(metricas_arbol_raw$MAE[metricas_arbol_raw$split == "Test"], 4)` y R2 = `r round(metricas_arbol_raw$R2[metricas_arbol_raw$split == "Test"], 4)`.
+
+La brecha train-test de RMSE es `r round(metricas_arbol_raw$RMSE[metricas_arbol_raw$split == "Test"] - metricas_arbol_raw$RMSE[metricas_arbol_raw$split == "Train"], 4)`, lo que sugiere un nivel de sobreajuste bajo para este arbol base.
+
+Las variables con mayor importancia se asocian principalmente con capacidad del alojamiento, tipo de propiedad y localizacion, patrones coherentes con la formacion de precios en plataformas de hospedaje.
+
+Como limitaciones, un arbol unico puede ser sensible a cambios en la muestra y tiende a simplificar relaciones continuas en reglas por tramos; por ello, este resultado se considera una linea base interpretable para comparaciones posteriores.
+
+
+### Link de GitHub
+
+https://github.com/Cisco890/Lab4_DM.git
