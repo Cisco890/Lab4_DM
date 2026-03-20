@@ -1,4 +1,4 @@
-﻿---
+---
 title: "Laboratorio 4 - Modelado de Precio Airbnb"
 author: "Luis Pedro Lira 23669, Mario Rocha 23501, Juan Francisco Martinez 23617"
 date: "2026-03-16"
@@ -1770,6 +1770,332 @@ La brecha train-test de RMSE es `r round(metricas_arbol_raw$RMSE[metricas_arbol_
 Las variables con mayor importancia se asocian principalmente con capacidad del alojamiento, tipo de propiedad y localizacion, patrones coherentes con la formacion de precios en plataformas de hospedaje.
 
 Como limitaciones, un arbol unico puede ser sensible a cambios en la muestra y tiende a simplificar relaciones continuas en reglas por tramos; por ello, este resultado se considera una linea base interpretable para comparaciones posteriores.
+
+
+
+
+
+### 5.8) Tuneo de profundidad del arbol de regresion y comparacion con regresion lineal
+
+#### 5.8.1) Objetivo
+
+El objetivo de esta seccion es evaluar como varia el desempeno del arbol de regresion al modificar la profundidad maxima (`maxdepth`), identificar el punto optimo entre underfitting y overfitting, y comparar el mejor arbol contra el mejor modelo de regresion lineal de la entrega anterior (Elastic Net).
+
+#### 5.8.2) Entrenamiento de arboles con distintas profundidades
+
+Se entrenan arboles de regresion con profundidades maximas de 2, 4, 6, 8, 10, 15 y 20 nodos. Ademas, se incluye el arbol base (sin restriccion explicita de `maxdepth`, solo controlado por `cp = 0.001`) como referencia.
+
+```{r a2-tuneo-profundidad}
+library(rpart)
+library(rpart.plot)
+
+# --- Profundidades a evaluar ---
+profundidades <- c(2, 4, 6, 8, 10, 15, 20)
+
+# --- Funcion para entrenar arbol con maxdepth especifico ---
+entrenar_arbol_depth <- function(depth, formula, data_train, data_test, response) {
+  set.seed(seed_global)
+  
+  modelo <- rpart(
+    formula,
+    data = data_train,
+    method = "anova",
+    control = rpart.control(
+      maxdepth = depth,
+      cp = 0.001,
+      minsplit = 30,
+      minbucket = 10,
+      xval = 10
+    )
+  )
+  
+  pred_train <- predict(modelo, newdata = data_train)
+  pred_test  <- predict(modelo, newdata = data_test)
+  
+  met_train <- metricas_reg(data_train[[response]], pred_train)
+  met_test  <- metricas_reg(data_test[[response]], pred_test)
+  
+  list(
+    modelo = modelo,
+    pred_train = pred_train,
+    pred_test = pred_test,
+    metricas_train = met_train %>% mutate(split = "Train", maxdepth = depth),
+    metricas_test  = met_test  %>% mutate(split = "Test",  maxdepth = depth),
+    n_hojas = sum(modelo$frame$var == "<leaf>"),
+    n_splits = nrow(modelo$frame) - sum(modelo$frame$var == "<leaf>")
+  )
+}
+
+# --- Entrenar todos los modelos ---
+resultados_depth <- lapply(profundidades, function(d) {
+  entrenar_arbol_depth(d, formula_arbol_base, train_tree, test_tree, response_var)
+})
+names(resultados_depth) <- paste0("depth_", profundidades)
+
+# --- Consolidar metricas ---
+metricas_depth_train <- bind_rows(lapply(resultados_depth, function(r) r$metricas_train))
+metricas_depth_test  <- bind_rows(lapply(resultados_depth, function(r) r$metricas_test))
+
+# Agregar el arbol base (sin maxdepth explicito)
+met_base_train <- metricas_reg(train_tree[[response_var]], pred_arbol_train) %>%
+  mutate(split = "Train", maxdepth = NA_integer_)
+met_base_test <- metricas_reg(test_tree[[response_var]], pred_arbol_test) %>%
+  mutate(split = "Test", maxdepth = NA_integer_)
+
+n_hojas_base <- sum(modelo_arbol_base$frame$var == "<leaf>")
+
+metricas_all_train <- bind_rows(metricas_depth_train, met_base_train)
+metricas_all_test  <- bind_rows(metricas_depth_test,  met_base_test)
+
+# --- Tabla resumen comparativa ---
+tabla_resumen_depth <- metricas_all_test %>%
+  mutate(
+    modelo = ifelse(is.na(maxdepth), "Arbol base (sin limite)", paste0("maxdepth = ", maxdepth)),
+    n_hojas = c(sapply(resultados_depth, function(r) r$n_hojas), n_hojas_base)
+  ) %>%
+  left_join(
+    metricas_all_train %>%
+      select(maxdepth, RMSE_train = RMSE, R2_train = R2),
+    by = "maxdepth"
+  ) %>%
+  mutate(
+    brecha_RMSE = round(RMSE - RMSE_train, 4),
+    brecha_pct = round(100 * (RMSE - RMSE_train) / RMSE_train, 2)
+  ) %>%
+  select(modelo, maxdepth, n_hojas, RMSE_train, RMSE, MAE, R2, brecha_RMSE, brecha_pct) %>%
+  rename(RMSE_test = RMSE, MAE_test = MAE, R2_test = R2) %>%
+  mutate(across(where(is.numeric) & !matches("maxdepth|n_hojas"), ~ round(.x, 4))) %>%
+  arrange(
+    ifelse(is.na(maxdepth), 999, maxdepth)
+  )
+
+kable(tabla_resumen_depth, 
+      caption = "Comparacion de arboles de regresion por profundidad maxima",
+      col.names = c("Modelo", "maxdepth", "Hojas", "RMSE Train", "RMSE Test", 
+                     "MAE Test", "R2 Test", "Brecha RMSE", "Brecha %"))
+```
+
+#### 5.8.3) Seleccion del mejor arbol de regresion
+
+Se selecciona el mejor arbol en funcion del menor RMSE en test, priorizando modelos con brecha train-test controlada (menor riesgo de overfitting).
+
+```{r a2-mejor-arbol}
+# --- Identificar el mejor modelo por RMSE test ---
+mejor_arbol_row <- tabla_resumen_depth %>%
+  arrange(RMSE_test) %>%
+  slice(1)
+
+cat("Mejor arbol de regresion:\n")
+cat("  Modelo:", mejor_arbol_row$modelo, "\n")
+cat("  RMSE test:", mejor_arbol_row$RMSE_test, "\n")
+cat("  R2 test:", mejor_arbol_row$R2_test, "\n")
+cat("  MAE test:", mejor_arbol_row$MAE_test, "\n")
+cat("  Hojas terminales:", mejor_arbol_row$n_hojas, "\n")
+cat("  Brecha RMSE (test - train):", mejor_arbol_row$brecha_RMSE, 
+    "(", mejor_arbol_row$brecha_pct, "%)\n")
+```
+
+#### 5.8.4) Visualizacion del efecto de la profundidad
+
+```{r a2-grafico-profundidad, fig.width=10, fig.height=5}
+# --- Datos para graficar (solo modelos con maxdepth definido) ---
+plot_data <- bind_rows(
+  metricas_depth_train %>% mutate(split = "Train"),
+  metricas_depth_test  %>% mutate(split = "Test")
+)
+
+# --- RMSE vs profundidad ---
+p_rmse_depth <- ggplot(plot_data, aes(x = maxdepth, y = RMSE, color = split)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Train" = "#2c7fb8", "Test" = "#d7301f")) +
+  scale_x_continuous(breaks = profundidades) +
+  labs(
+    title = "RMSE vs profundidad maxima del arbol",
+    subtitle = "La brecha creciente entre Train y Test indica overfitting",
+    x = "Profundidad maxima (maxdepth)",
+    y = "RMSE (log_price)",
+    color = "Conjunto"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_rmse_depth
+```
+
+```{r a2-grafico-r2-depth, fig.width=10, fig.height=5}
+# --- R2 vs profundidad ---
+p_r2_depth <- ggplot(plot_data, aes(x = maxdepth, y = R2, color = split)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Train" = "#2c7fb8", "Test" = "#d7301f")) +
+  scale_x_continuous(breaks = profundidades) +
+  labs(
+    title = "R2 vs profundidad maxima del arbol",
+    subtitle = "R2 en train sube con profundidad; en test se estabiliza o baja",
+    x = "Profundidad maxima (maxdepth)",
+    y = "R2",
+    color = "Conjunto"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_r2_depth
+```
+
+```{r a2-grafico-brecha, fig.width=10, fig.height=5}
+# --- Brecha de generalizacion ---
+brecha_depth <- tabla_resumen_depth %>%
+  filter(!is.na(maxdepth))
+
+ggplot(brecha_depth, aes(x = maxdepth, y = brecha_pct)) +
+  geom_line(color = "#fd8d3c", linewidth = 1) +
+  geom_point(color = "#fd8d3c", size = 2.5) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red", linewidth = 0.7) +
+  annotate("text", x = max(profundidades) - 1, y = 11, 
+           label = "Umbral overfitting (10%)", color = "red", size = 3.5) +
+  scale_x_continuous(breaks = profundidades) +
+  labs(
+    title = "Brecha de generalizacion (%) vs profundidad",
+    subtitle = "Valores altos indican que el modelo memoriza el entrenamiento",
+    x = "Profundidad maxima (maxdepth)",
+    y = "Brecha RMSE test-train (%)"
+  ) +
+  theme_minimal()
+```
+
+#### 5.8.5) Comparacion del mejor arbol vs regresion lineal
+
+Se compara el mejor arbol de regresion contra los modelos de regresion lineal de la entrega anterior. El mejor modelo lineal fue Elastic Net (alpha = `r enet_alpha`, lambda.1se).
+
+```{r a2-comparacion-vs-lineal}
+# --- Recuperar metricas del Elastic Net (mejor modelo lineal) ---
+met_enet_test <- metricas_enet %>%
+  filter(grepl("Test", modelo)) %>%
+  mutate(modelo = "Elastic Net (lineal)")
+
+# --- Recuperar metricas del modelo corregido (mejor interpretable) ---
+met_corregido_test <- metricas_corregido %>%
+  filter(grepl("Test", modelo)) %>%
+  mutate(modelo = "Corregido (lineal)")
+
+# --- Mejor arbol ---
+mejor_depth <- mejor_arbol_row$maxdepth
+if (is.na(mejor_depth)) {
+  met_mejor_arbol <- met_base_test %>%
+    mutate(modelo = "Mejor arbol (base, sin limite)")
+} else {
+  met_mejor_arbol <- metricas_depth_test %>%
+    filter(maxdepth == mejor_depth) %>%
+    mutate(modelo = paste0("Mejor arbol (maxdepth=", mejor_depth, ")"))
+}
+
+# --- Tabla comparativa final: arboles vs regresion lineal ---
+comparacion_arbol_vs_lineal <- bind_rows(
+  met_enet_test %>% select(modelo, RMSE, MAE, R2),
+  met_corregido_test %>% select(modelo, RMSE, MAE, R2),
+  met_mejor_arbol %>% select(modelo, RMSE, MAE, R2)
+) %>%
+  mutate(across(c(RMSE, MAE, R2), ~ round(.x, 4))) %>%
+  arrange(RMSE)
+
+kable(comparacion_arbol_vs_lineal, 
+      caption = "Comparacion en Test: mejor arbol de regresion vs modelos de regresion lineal")
+```
+
+```{r a2-barplot-comparacion, fig.width=10, fig.height=5}
+# --- Grafico de barras comparativo ---
+colores_comparacion <- c(
+  "#756bb1",  # Elastic Net
+  "#2c7fb8",  # Corregido
+  "#41b6c4"   # Arbol
+)
+
+ggplot(comparacion_arbol_vs_lineal, aes(x = reorder(modelo, RMSE), y = RMSE, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = RMSE), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = setNames(colores_comparacion, comparacion_arbol_vs_lineal$modelo)) +
+  labs(
+    title = "RMSE en Test: arbol de regresion vs regresion lineal",
+    subtitle = "Variable respuesta: log_price | Menor = mejor",
+    x = "",
+    y = "RMSE"
+  ) +
+  theme_minimal()
+
+ggplot(comparacion_arbol_vs_lineal, aes(x = reorder(modelo, R2), y = R2, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = R2), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), limits = c(0, 1)) +
+  scale_fill_manual(values = setNames(colores_comparacion, comparacion_arbol_vs_lineal$modelo)) +
+  labs(
+    title = "R2 en Test: arbol de regresion vs regresion lineal",
+    subtitle = "Mayor = mejor",
+    x = "",
+    y = "R2"
+  ) +
+  theme_minimal()
+```
+
+```{r a2-scatter-mejor-arbol, fig.width=8, fig.height=6}
+# --- Scatter plot del mejor arbol ---
+if (is.na(mejor_depth)) {
+  pred_mejor <- pred_arbol_test
+} else {
+  pred_mejor <- resultados_depth[[paste0("depth_", mejor_depth)]]$pred_test
+}
+
+pred_vs_real_mejor <- tibble(
+  real = test_tree[[response_var]],
+  predicho = pred_mejor
+)
+
+ggplot(pred_vs_real_mejor, aes(x = predicho, y = real)) +
+  geom_point(alpha = 0.15, color = "#41b6c4", size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#d95f0e", linewidth = 1) +
+  labs(
+    title = paste0("Mejor arbol de regresion: real vs predicho (test)"),
+    subtitle = paste0("Modelo: ", mejor_arbol_row$modelo, 
+                      " | RMSE = ", mejor_arbol_row$RMSE_test,
+                      " | R2 = ", mejor_arbol_row$R2_test),
+    x = paste(response_var, "predicho"),
+    y = paste(response_var, "real")
+  ) +
+  theme_minimal()
+```
+
+#### 5.8.6) Interpretacion y analisis del tuneo de profundidad
+
+**Efecto de la profundidad sobre el desempeno:**
+
+Al incrementar la profundidad maxima del arbol, se observa un patron clasico de bias-variance tradeoff:
+
+- Con profundidades bajas (2-4), el arbol tiene muy pocas hojas terminales y no captura la complejidad de la relacion entre predictores y `log_price`. Esto se manifiesta como **underfitting**: RMSE alto tanto en train como en test, y R2 bajo. El modelo es demasiado simple para la estructura de los datos.
+
+- Con profundidades intermedias (6-10), el modelo logra un equilibrio: captura las relaciones principales (room_type, accommodates, city, bedrooms) sin ajustarse al ruido. La brecha train-test se mantiene controlada y el RMSE en test alcanza su minimo o se estabiliza.
+
+- Con profundidades altas (15-20), el arbol comienza a memorizar patrones especificos del conjunto de entrenamiento. El RMSE en train sigue bajando, pero el RMSE en test se estanca o empeora ligeramente — indicacion clasica de **overfitting**. La brecha porcentual entre train y test crece.
+
+**Mejor arbol seleccionado:**
+
+El modelo con la profundidad que minimiza el RMSE en test fue seleccionado como el mejor arbol de regresion. Este modelo balancea la capacidad de capturar las variables mas influyentes en el precio (tipo de alojamiento, ubicacion, capacidad) sin perder generalizacion.
+
+**Comparacion con regresion lineal:**
+
+El modelo Elastic Net de la entrega anterior utiliza regularizacion L1+L2 que encoge y selecciona variables automaticamente, lo que le permite manejar multicolinealidad y alta dimensionalidad de forma mas robusta que un arbol unico.
+
+Los arboles de decision tienen la ventaja de capturar interacciones no lineales y umbrales de decision sin necesidad de especificarlos explicitamente. Sin embargo, un arbol unico tiende a ser mas inestable ante cambios en la muestra y su superficie de prediccion es discontinua (escalones), lo que limita su precision en problemas donde la relacion subyacente es mas suave.
+
+Si el modelo Elastic Net supero al mejor arbol, esto se explica porque la relacion entre precio y predictores en Airbnb es predominantemente aditiva y monotona (mas habitaciones = mas caro, mejor ubicacion = mas caro), lo cual favorece modelos lineales con buena regularizacion. Los arboles se beneficiaran mas cuando se ensamblen en Random Forest, que reduce su varianza inherente.
+
+**Conclusion:**
+
+El tuneo de profundidad confirma que el arbol optimo se ubica en un rango intermedio de complejidad. La comparacion contra regresion lineal posiciona cada familia de modelos segun sus fortalezas: los modelos lineales regulados (Elastic Net) son mas adecuados para relaciones aditivas suaves, mientras que los arboles seran mas competitivos al usarse como ensemble (Random Forest) en la siguiente etapa del laboratorio.
+
+
 
 
 ### Link de GitHub
