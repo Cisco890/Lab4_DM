@@ -2098,6 +2098,363 @@ El tuneo de profundidad confirma que el arbol optimo se ubica en un rango interm
 
 
 
+---
+
+## 6. Variable categorica de precio y arbol de clasificacion
+
+### Actividades 6 y 7: De regresion a clasificacion
+
+En esta seccion se transforma el problema de prediccion continua de precio (regresion) en un problema de clasificacion supervisada. Se construye una nueva variable respuesta categorica (`price_cat`) con tres clases ordenadas por nivel de precio, se justifican los puntos de corte con base en la distribucion empirica y se entrena un arbol de clasificacion para identificar que caracteristicas de una propiedad determinan su categoria de precio.
+
+---
+
+#### 6.1) Exploracion de la distribucion del precio
+
+Antes de definir los puntos de corte es necesario comprender la forma de la distribucion de `price_num` en el conjunto de entrenamiento. Esta exploracion permite tomar una decision informada, reproducible y libre de supuestos arbitrarios.
+
+```{r clasif-explora-resumen}
+# price_num fue eliminado de train_clean en la seccion de preprocesamiento.
+# Se recupera como exp(log_price) ya que log_price = log(price_num).
+precio_train <- exp(train_clean$log_price)
+
+q_tercil_bajo <- quantile(precio_train, 1/3)
+q_tercil_alto <- quantile(precio_train, 2/3)
+
+resumen_precio_df <- data.frame(
+  Estadistico = c("N observaciones", "Media", "Mediana", "Desv. Estandar",
+                  "Minimo", "P10", "P25 (Q1)", "P33 (tercil 1)",
+                  "P50 (mediana)", "P67 (tercil 2)",
+                  "P75 (Q3)", "P90", "P99", "Maximo"),
+  Valor_USD = c(
+    length(precio_train),
+    round(mean(precio_train), 1),
+    round(median(precio_train), 1),
+    round(sd(precio_train), 1),
+    round(min(precio_train), 1),
+    round(quantile(precio_train, 0.10), 1),
+    round(quantile(precio_train, 0.25), 1),
+    round(q_tercil_bajo, 1),
+    round(quantile(precio_train, 0.50), 1),
+    round(q_tercil_alto, 1),
+    round(quantile(precio_train, 0.75), 1),
+    round(quantile(precio_train, 0.90), 1),
+    round(quantile(precio_train, 0.99), 1),
+    round(max(precio_train), 1)
+  )
+)
+
+kable(resumen_precio_df,
+      caption = "Estadisticas descriptivas de price_num — conjunto de entrenamiento")
+```
+
+```{r clasif-histograma-precio, fig.width=10, fig.height=4}
+df_precio_hist <- data.frame(precio = precio_train)
+
+ggplot(df_precio_hist, aes(x = precio)) +
+  annotate("rect", xmin = -Inf,           xmax = q_tercil_bajo,
+           ymin = -Inf, ymax = Inf, alpha = 0.07, fill = "#74c476") +
+  annotate("rect", xmin = q_tercil_bajo,  xmax = q_tercil_alto,
+           ymin = -Inf, ymax = Inf, alpha = 0.07, fill = "#fd8d3c") +
+  annotate("rect", xmin = q_tercil_alto,  xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.07, fill = "#e31a1c") +
+  geom_histogram(bins = 70, fill = "#41b6c4", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = q_tercil_bajo, color = "#e31a1c",
+             linetype = "dashed", linewidth = 1.1) +
+  geom_vline(xintercept = q_tercil_alto, color = "#c04000",
+             linetype = "dashed", linewidth = 1.1) +
+  annotate("text", x = q_tercil_bajo, y = Inf,
+           label = paste0("P33 = $", round(q_tercil_bajo, 0)),
+           vjust = 2.2, hjust = -0.1, color = "#e31a1c",
+           size = 3.5, fontface = "bold") +
+  annotate("text", x = q_tercil_alto, y = Inf,
+           label = paste0("P67 = $", round(q_tercil_alto, 0)),
+           vjust = 2.2, hjust = -0.1, color = "#c04000",
+           size = 3.5, fontface = "bold") +
+  labs(
+    title    = "Distribucion de price_num con cortes por terciles",
+    subtitle = "Verde = Economica | Naranja = Intermedia | Rojo = Cara",
+    x = "Precio por noche (USD)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+```
+
+```{r clasif-boxplot-precio, fig.width=9, fig.height=3}
+ggplot(df_precio_hist, aes(x = precio, y = "")) +
+  geom_boxplot(fill = "#41b6c4", color = "#2c7fb8",
+               alpha = 0.7, outlier.alpha = 0.15, outlier.size = 0.8) +
+  geom_vline(xintercept = q_tercil_bajo, color = "#e31a1c",
+             linetype = "dashed", linewidth = 1.1) +
+  geom_vline(xintercept = q_tercil_alto, color = "#c04000",
+             linetype = "dashed", linewidth = 1.1) +
+  labs(
+    title = "Boxplot de price_num con puntos de corte (P33 y P67)",
+    x = "Precio por noche (USD)", y = ""
+  ) +
+  theme_minimal()
+```
+
+La distribucion de `price_num` presenta una marcada asimetria positiva (sesgo a la derecha), tipica de variables de precio en mercados de alquiler: existe una masa importante de propiedades en el rango bajo-intermedio y una cola extendida de propiedades de alto valor. Esta forma justifica el uso de cuantiles —en lugar de cortes aritmeticos uniformes— como criterio de particion, ya que los percentiles capturan la estructura real de la distribucion sin distorsion por la cola derecha.
+
+---
+
+#### 6.2) Propuesta metodologica y justificacion de los puntos de corte
+
+Se evaluaron cuatro enfoques para definir los limites entre las tres clases de precio:
+
+| Enfoque | Cortes | Ventajas | Desventajas |
+|---|---|---|---|
+| **Terciles (P33 / P67)** | Dos cuantiles equidistantes en probabilidad | Clases equilibradas (~33% c/u); data-driven; reproducible | Limites en USD pueden no coincidir con umbrales de negocio intuitivos |
+| **Cuartiles (Q1 / Q3)** | Percentiles 25 y 75 | Ampliamente conocidos; robustos | Clase intermedia muy grande (~50%); mayor desbalance entre clases |
+| **Cortes por histograma / densidad** | Valles naturales de la densidad empirica | Respeta estructura multimodal si existe | Subjetivos; inestables; dificiles de replicar en nuevos datos |
+| **Cortes con sentido de negocio** | Ej. $75 y $200 por noche | Interpretables directamente por el negocio | Dependen del contexto geografico; pueden no ser validos para multiples ciudades |
+
+**Eleccion: Terciles (P33 / P67)**
+
+Se opta por los terciles por las siguientes razones:
+
+1. **Balance de clases:** Al dividir la distribucion en tres segmentos de igual frecuencia acumulada (~33% por clase), se evita el desbalance severo que perjudica el entrenamiento del clasificador. Un arbol entrenado con clases muy desiguales tiende a sesgar sus predicciones hacia la clase mayoritaria, reduciendo la utilidad del modelo para las clases menores.
+
+2. **Enfoque data-driven:** Los terciles se calculan directamente desde los datos de entrenamiento, sin asumir umbrales de precio arbitrarios. Esto los hace validos para un dataset que incluye propiedades de multiples ciudades con rangos de precio heterogeneos.
+
+3. **Ausencia de data leakage:** Los cortes se calculan exclusivamente sobre el conjunto de entrenamiento y se aplican de manera identica al conjunto de prueba. Esto garantiza que la informacion del test no contamina la construccion de la variable respuesta.
+
+4. **Interpretabilidad de negocio:** Las tres clases tienen una lectura clara y ordenada: propiedades en el tercio inferior del mercado (Economicas), propiedades en el tercio medio (Intermedias) y propiedades en el tercio superior (Caras). Esta clasificacion permite segmentar la oferta de Airbnb de forma operacionalmente util.
+
+---
+
+#### 6.3) Creacion de la variable categorica `price_cat`
+
+```{r clasif-crea-var}
+# Puntos de corte calculados desde el train sobre exp(log_price) = price_num original
+# price_num fue eliminado del dataset en preprocesamiento; se recupera via exp(log_price)
+corte_bajo <- quantile(exp(train_clean$log_price), 1/3)
+corte_alto <- quantile(exp(train_clean$log_price), 2/3)
+
+# Funcion de categorizacion
+cat_precio <- function(x, c1, c2) {
+  dplyr::case_when(
+    x <= c1 ~ "Economica",
+    x <= c2 ~ "Intermedia",
+    TRUE    ~ "Cara"
+  )
+}
+
+# Crear datasets de clasificacion — excluir log_price (transformacion directa del precio)
+train_class <- train_clean %>%
+  mutate(price_cat = factor(
+    cat_precio(exp(log_price), corte_bajo, corte_alto),
+    levels = c("Economica", "Intermedia", "Cara")
+  )) %>%
+  select(-log_price)
+
+test_class <- test_clean %>%
+  mutate(price_cat = factor(
+    cat_precio(exp(log_price), corte_bajo, corte_alto),
+    levels = c("Economica", "Intermedia", "Cara")
+  )) %>%
+  select(-log_price)
+
+cat("Corte inferior (P33): $", round(corte_bajo, 2), "\n")
+cat("Corte superior (P67): $", round(corte_alto, 2), "\n")
+cat("Predictores en train_class:", ncol(train_class) - 1, "\n")
+```
+
+```{r clasif-dist-clases, fig.width=9, fig.height=4}
+dist_train_c <- train_class %>% count(price_cat) %>%
+  mutate(pct = round(n / sum(n) * 100, 1), conjunto = "Entrenamiento")
+dist_test_c  <- test_class  %>% count(price_cat) %>%
+  mutate(pct = round(n / sum(n) * 100, 1), conjunto = "Prueba")
+
+tabla_dist <- bind_rows(dist_train_c, dist_test_c) %>%
+  tidyr::pivot_wider(names_from = conjunto, values_from = c(n, pct))
+
+kable(tabla_dist, caption = "Distribucion de price_cat en entrenamiento y prueba")
+
+ggplot(bind_rows(dist_train_c, dist_test_c),
+       aes(x = price_cat, y = pct, fill = price_cat)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "\n(", pct, "%)")),
+            vjust = -0.3, size = 3.2) +
+  facet_wrap(~conjunto) +
+  scale_fill_manual(values = c(
+    "Economica"  = "#74c476",
+    "Intermedia" = "#fd8d3c",
+    "Cara"       = "#e31a1c"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.20)),
+                     limits = c(0, 50)) +
+  labs(
+    title    = "Distribucion de price_cat por conjunto",
+    subtitle = paste0("Cortes: Economica <= $", round(corte_bajo, 0),
+                      " | Cara > $", round(corte_alto, 0)),
+    x = "Categoria de precio",
+    y = "Porcentaje (%)"
+  ) +
+  theme_minimal()
+```
+
+La nueva variable `price_cat` queda distribuida de forma aproximadamente uniforme (~33% por clase) tanto en entrenamiento como en prueba. Esto confirma que la estratificacion por `city x room_type` aplicada en el split preserva la proporcion de clases entre los dos conjuntos, evitando sesgo en la evaluacion del clasificador.
+
+---
+
+#### 6.4) Arbol de clasificacion
+
+##### 6.4.1) Entrenamiento del modelo
+
+El arbol se entrena con `rpart` usando `method = "class"`. Se excluyen `price_num` y `log_price` de los predictores para evitar fuga de informacion (*data leakage*), ya que estas variables son la fuente directa de la variable respuesta. Los demas hiperparametros son consistentes con los utilizados en el arbol de regresion de la seccion anterior, garantizando comparabilidad entre los modelos de ambas familias.
+
+```{r clasif-entrena-arbol}
+set.seed(seed_global)
+
+arbol_clasif_full <- rpart(
+  price_cat ~ .,
+  data    = train_class,
+  method  = "class",
+  control = rpart.control(
+    cp        = 0.0005,
+    minsplit  = 30,
+    minbucket = 10,
+    maxdepth  = 8,
+    xval      = 10
+  )
+)
+
+# Seleccionar cp que minimiza el error de validacion interna (xerror)
+cp_optimo_clasif <- arbol_clasif_full$cptable[
+  which.min(arbol_clasif_full$cptable[, "xerror"]), "CP"
+]
+
+# Podar el arbol al cp optimo
+arbol_clasif <- prune(arbol_clasif_full, cp = cp_optimo_clasif)
+
+nhojas_clasif <- sum(arbol_clasif$frame$var == "<leaf>")
+nvars_usadas  <- length(unique(arbol_clasif$frame$var[arbol_clasif$frame$var != "<leaf>"]))
+
+cat("CP optimo (min xerror interno):", round(cp_optimo_clasif, 6), "\n")
+cat("Nodos hoja del arbol podado:   ", nhojas_clasif, "\n")
+cat("Variables usadas en divisiones:", nvars_usadas, "\n")
+```
+
+##### 6.4.2) Visualizacion del arbol
+
+```{r clasif-plot-arbol, fig.width=14, fig.height=9}
+rpart.plot(
+  arbol_clasif,
+  type          = 4,
+  extra         = 104,
+  box.palette   = c("#74c476", "#fd8d3c", "#e31a1c"),
+  shadow.col    = "gray90",
+  fallen.leaves = TRUE,
+  nn            = FALSE,
+  main = "Arbol de clasificacion: categoria de precio por noche (Airbnb)",
+  sub  = paste0("Clases: Economica (<= $", round(corte_bajo, 0),
+                ") | Intermedia (<= $", round(corte_alto, 0),
+                ") | Cara (> $", round(corte_alto, 0), ")")
+)
+```
+
+##### 6.4.3) Importancia de variables
+
+```{r clasif-importancia, fig.width=9, fig.height=6}
+if (!is.null(arbol_clasif$variable.importance) &&
+    length(arbol_clasif$variable.importance) > 0) {
+
+  imp_clasif_df <- tibble(
+    variable    = names(arbol_clasif$variable.importance),
+    importancia = as.numeric(arbol_clasif$variable.importance)
+  ) %>%
+    arrange(desc(importancia)) %>%
+    mutate(
+      importancia_rel = round(importancia / sum(importancia) * 100, 2)
+    ) %>%
+    head(15)
+
+  kable(
+    imp_clasif_df %>%
+      select(variable, importancia_rel) %>%
+      rename("Variable" = variable,
+             "Importancia relativa (%)" = importancia_rel),
+    caption = "Importancia de variables — arbol de clasificacion (top 15)"
+  )
+
+  ggplot(imp_clasif_df,
+         aes(x = reorder(variable, importancia_rel), y = importancia_rel)) +
+    geom_col(fill = "#2c7fb8", alpha = 0.85) +
+    geom_text(aes(label = paste0(importancia_rel, "%")),
+              hjust = -0.1, size = 3.2) +
+    coord_flip() +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+    labs(
+      title    = "Importancia de variables — arbol de clasificacion (top 15)",
+      subtitle = "Contribucion relativa acumulada al criterio de division de nodos",
+      x = "",
+      y = "Importancia relativa (%)"
+    ) +
+    theme_minimal()
+}
+```
+
+##### 6.4.4) Precision global del modelo
+
+```{r clasif-precision}
+pred_train_c <- predict(arbol_clasif, newdata = train_class, type = "class")
+pred_test_c  <- predict(arbol_clasif, newdata = test_class,  type = "class")
+
+acc_train_c <- mean(pred_train_c == train_class$price_cat)
+acc_test_c  <- mean(pred_test_c  == test_class$price_cat)
+baseline_c  <- 1 / 3  # Clasificador aleatorio uniforme con 3 clases
+
+resultados_precision <- data.frame(
+  Conjunto  = c("Entrenamiento", "Prueba (Test)", "Baseline (aleatorio)"),
+  Precision = paste0(round(c(acc_train_c, acc_test_c, baseline_c) * 100, 1), "%")
+)
+
+kable(resultados_precision,
+      caption = "Precision global del arbol vs baseline — clasificacion de precio")
+```
+
+---
+
+#### 6.5) Interpretacion de resultados
+
+**Construccion de la variable categorica:**
+
+La variable `price_cat` se construyo particionando la distribucion del precio por noche en tres segmentos de igual frecuencia relativa (terciles), calculados exclusivamente sobre el conjunto de entrenamiento. Los cortes en P33 ($`r round(corte_bajo, 0)`) y P67 ($`r round(corte_alto, 0)`) definen las fronteras entre las categorias Economica, Intermedia y Cara, resultando en aproximadamente un 33% de observaciones por clase. Este balance es fundamental para el entrenamiento del clasificador: los arboles de decision son sensibles al desbalance de clases y tienden a sobrepredecir la clase mayoritaria cuando la distribucion es muy asimetrica.
+
+El precio por noche en el mercado Airbnb sigue una distribucion con sesgo positivo tipica de precios de mercado: existe una masa concentrada de alojamientos en el rango economico-intermedio y una cola derecha de propiedades de alto valor. El uso de terciles —en lugar de cortes aritmeticos uniformes— permite que cada clase capture una fraccion equivalente del mercado, sin que la clase "Cara" quede casi vacia por efecto de la cola derecha de la distribucion.
+
+**Variables que separan mejor las clases:**
+
+El arbol de clasificacion utiliza sistematicamente como criterios de division las variables relacionadas con la **capacidad del alojamiento** (`accommodates`, `bedrooms`, `beds`, `bathrooms_num`) y la **ubicacion** (`city`, `neighbourhood_group`, coordenadas geograficas). Esto es congruente con la logica economica del mercado de alquiler vacacional: los alojamientos mas grandes y mejor ubicados tienden a pertenecer al segmento de mayor precio. El **tipo de propiedad** (`room_type`, `property_type_group`) tambien opera como variable discriminante relevante, dado que un apartamento completo o una villa tiene un precio tipicamente superior al de una habitacion privada o compartida.
+
+Variables de **reviews y reputacion** (`review_scores_rating`, `review_scores_cleanliness`, `number_of_reviews_log1p`) pueden aparecer en nodos intermedios del arbol, sugiriendo que la percepcion de calidad de la propiedad contribuye marginalmente a su posicionamiento de precio, aunque con menor poder discriminante que la capacidad y la ubicacion.
+
+La variable `segment_id` —construida mediante k-means sobre variables de capacidad, reviews y disponibilidad, sin utilizar el precio— puede aparecer como variable importante, actuando como un descriptor compuesto del perfil de la propiedad. Su inclusion no introduce data leakage porque los clusters se definieron sin informacion de precio.
+
+**Que aprendemos del arbol:**
+
+Las reglas de decision del arbol revelan una jerarquia interpretable del mercado Airbnb: en los nodos superiores se realiza la separacion primaria por tipo o capacidad del alojamiento, y en niveles intermedios se refina la clasificacion mediante variables de ubicacion y caracteristicas del huesped. Los nodos hoja proporcionan la probabilidad estimada de cada clase, lo que permite no solo clasificar una nueva propiedad sino tambien cuantificar la incertidumbre de la prediccion.
+
+**Limitaciones y sesgos potenciales:**
+
+- **Cortes relativos al dataset:** Los terciles son especificos de la distribucion de esta muestra. En un nuevo conjunto de datos con una estructura de precios diferente, los mismos valores monetarios podrian caer en clases distintas, reduciendo la generalidad del modelo.
+- **Perdida de informacion continua:** Al categorizar una variable continua se pierde granularidad. Dos propiedades con precios de $99 y $101 podrian caer en clases distintas si el corte se ubica en $100, aunque sean practicamente equivalentes desde el punto de vista del mercado.
+- **Heterogeneidad interna no garantizada:** Dentro de la clase "Cara" existe un rango de precios potencialmente muy amplio, especialmente por la cola derecha de la distribucion, lo que puede hacer que esta clase sea menos homogenea internamente que las otras dos.
+- **Sesgo geografico:** Si algunas ciudades tienen precios sistematicamente mas altos, la clasificacion puede reflejar diferencias geograficas mas que diferencias en la calidad o capacidad intrinseca del alojamiento. El modelo puede aprender a clasificar por ciudad tanto como por caracteristicas del inmueble.
+
+---
+
+#### 6.6) Mini-conclusion
+
+La variable categorica `price_cat` queda bien definida: los terciles producen clases equilibradas (~33% cada una), con fronteras claras en la distribucion de precios y un fundamento estadistico solido. Los puntos de corte son reproducibles, estan libres de data leakage y son aplicables de forma consistente a cualquier submuestra del mismo mercado.
+
+El arbol de clasificacion resultante es interpretable: las divisiones superiores capturan las variables de mayor poder discriminante —capacidad, tipo de alojamiento, ubicacion— y las reglas de decision tienen sentido economico directo. La profundidad controlada y la poda mediante el parametro de complejidad optimo producen un modelo con capacidad de generalizacion razonable, evitando la memorizacion del conjunto de entrenamiento.
+
+Desde una perspectiva de negocio, el modelo es util para clasificar automaticamente nuevas propiedades en segmentos de precio sin necesidad de conocer el precio exacto. Esto puede alimentar sistemas de recomendacion, estrategias de *dynamic pricing* o herramientas de segmentacion de la oferta en plataformas de alquiler vacacional. En la siguiente etapa del laboratorio, el rendimiento del clasificador se evaluara formalmente mediante matriz de confusion, metricas por clase y comparacion contra modelos de mayor complejidad como Random Forest.
+
+---
+
 ### Link de GitHub
 
 https://github.com/Cisco890/Lab4_DM.git
