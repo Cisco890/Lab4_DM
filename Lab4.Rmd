@@ -2416,6 +2416,139 @@ kable(resultados_precision,
 
 ---
 
+##### 6.4.5) Evaluacion en test con matriz de confusion y metricas por clase
+
+```{r clasif-eval-test-matriz}
+# Alias solicitados para el reporte
+modelo_clasificacion <- arbol_clasif
+test_data <- test_class
+
+# Asegurar niveles consistentes entre real y predicho
+test_data$price_cat <- factor(test_data$price_cat, levels = levels(train_class$price_cat))
+
+# Predicciones en test
+pred_test <- predict(modelo_clasificacion, newdata = test_data, type = "class")
+pred_test <- factor(pred_test, levels = levels(test_data$price_cat))
+
+# Matriz de confusion (conteos y proporcion por fila real)
+conf_matrix <- table(
+  Real = test_data$price_cat,
+  Predicha = pred_test
+)
+conf_matrix_prop <- prop.table(conf_matrix, margin = 1)
+
+# Componentes base por clase
+n_total <- sum(conf_matrix)
+tp <- diag(conf_matrix)
+fn <- rowSums(conf_matrix) - tp
+fp <- colSums(conf_matrix) - tp
+tn <- n_total - tp - fn - fp
+
+# Metricas globales
+accuracy_global <- sum(tp) / n_total
+error_global <- 1 - accuracy_global
+
+# Metricas por clase
+precision_class <- ifelse((tp + fp) == 0, NA_real_, tp / (tp + fp))
+recall_class <- ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn))
+f1_class <- ifelse(
+  is.na(precision_class) | is.na(recall_class) | (precision_class + recall_class) == 0,
+  NA_real_,
+  2 * precision_class * recall_class / (precision_class + recall_class)
+)
+specificity_class <- ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp))
+balanced_acc_class <- (recall_class + specificity_class) / 2
+balanced_acc_global <- mean(balanced_acc_class, na.rm = TRUE)
+macro_f1 <- mean(f1_class, na.rm = TRUE)
+
+metricas_globales <- tibble(
+  Accuracy = round(accuracy_global, 4),
+  Error_global = round(error_global, 4),
+  Balanced_Accuracy = round(balanced_acc_global, 4),
+  Macro_F1 = round(macro_f1, 4),
+  N_test = n_total
+)
+
+metricas_por_clase <- tibble(
+  Clase = rownames(conf_matrix),
+  Soporte_real = as.integer(rowSums(conf_matrix)),
+  Aciertos = as.integer(tp),
+  Proporcion_aciertos = round(recall_class, 4),
+  Precision = round(precision_class, 4),
+  Recall = round(recall_class, 4),
+  F1 = round(f1_class, 4),
+  Balanced_Accuracy = round(balanced_acc_class, 4)
+) %>%
+  arrange(desc(Recall))
+
+# Tabla comparativa real vs predicha (incluye proporcion por clase real)
+tabla_comparativa <- as.data.frame(conf_matrix) %>%
+  rename(Clase_real = Real, Clase_predicha = Predicha, Frecuencia = Freq) %>%
+  group_by(Clase_real) %>%
+  mutate(Proporcion_fila = round(Frecuencia / sum(Frecuencia), 4)) %>%
+  ungroup() %>%
+  arrange(desc(Frecuencia))
+
+errores_detalle <- tabla_comparativa %>%
+  filter(Clase_real != Clase_predicha) %>%
+  arrange(desc(Frecuencia))
+
+clase_mejor <- metricas_por_clase %>%
+  slice_max(Recall, n = 1, with_ties = FALSE)
+clase_peor <- metricas_por_clase %>%
+  slice_min(Recall, n = 1, with_ties = FALSE)
+
+if (nrow(errores_detalle) > 0) {
+  error_mas <- errores_detalle %>%
+    slice_max(Frecuencia, n = 1, with_ties = FALSE)
+} else {
+  error_mas <- tibble(
+    Clase_real = NA_character_,
+    Clase_predicha = NA_character_,
+    Frecuencia = 0,
+    Proporcion_fila = 0
+  )
+}
+
+orden_clases <- levels(test_data$price_cat)
+mapa_orden <- setNames(seq_along(orden_clases), orden_clases)
+
+errores_gravedad <- errores_detalle %>%
+  mutate(
+    salto = abs(
+      as.integer(mapa_orden[as.character(Clase_real)]) -
+        as.integer(mapa_orden[as.character(Clase_predicha)])
+    ),
+    tipo_error = ifelse(salto <= 1, "Adyacente", "Extremo")
+  )
+
+if (nrow(errores_gravedad) > 0) {
+  resumen_gravedad <- errores_gravedad %>%
+    group_by(tipo_error) %>%
+    summarise(n = sum(Frecuencia), .groups = "drop")
+  prop_error_extremo <- resumen_gravedad %>%
+    filter(tipo_error == "Extremo") %>%
+    pull(n)
+  if (length(prop_error_extremo) == 0) prop_error_extremo <- 0
+  prop_error_extremo <- 100 * prop_error_extremo / sum(resumen_gravedad$n)
+  resumen_gravedad <- resumen_gravedad %>%
+    mutate(pct = round(100 * n / sum(n), 2))
+} else {
+  resumen_gravedad <- tibble(tipo_error = "Sin errores", n = 0, pct = 0)
+  prop_error_extremo <- 0
+}
+
+kable(conf_matrix, caption = "Matriz de confusion en test (conteos absolutos)")
+kable(round(conf_matrix_prop, 4), caption = "Matriz de confusion normalizada por clase real")
+kable(metricas_globales, caption = "Metricas globales de clasificacion en test")
+kable(metricas_por_clase, caption = "Metricas por clase (precision, recall, F1 y balanced accuracy)")
+kable(tabla_comparativa, caption = "Tabla comparativa: clase real vs clase predicha")
+kable(errores_detalle, caption = "Detalle de confusiones (errores) en test")
+kable(resumen_gravedad, caption = "Importancia de errores: adyacentes vs extremos")
+```
+
+---
+
 #### 6.5) Interpretacion de resultados
 
 **Construccion de la variable categorica:**
@@ -2443,6 +2576,32 @@ Las reglas de decision del arbol revelan una jerarquia interpretable del mercado
 - **Heterogeneidad interna no garantizada:** Dentro de la clase "Cara" existe un rango de precios potencialmente muy amplio, especialmente por la cola derecha de la distribucion, lo que puede hacer que esta clase sea menos homogenea internamente que las otras dos.
 - **Sesgo geografico:** Si algunas ciudades tienen precios sistematicamente mas altos, la clasificacion puede reflejar diferencias geograficas mas que diferencias en la calidad o capacidad intrinseca del alojamiento. El modelo puede aprender a clasificar por ciudad tanto como por caracteristicas del inmueble.
 
+##### 6.5.1) Efectividad general
+
+En el conjunto de prueba, el arbol de clasificacion obtuvo una exactitud global de `r round(100 * metricas_globales$Accuracy, 1)`% y un error global de `r round(100 * metricas_globales$Error_global, 1)`%. Complementariamente, la *balanced accuracy* global fue `r round(100 * metricas_globales$Balanced_Accuracy, 1)`% y el *macro-F1* fue `r round(100 * metricas_globales$Macro_F1, 1)`%.
+
+Con estos resultados, la efectividad general del modelo puede clasificarse como `r if (metricas_globales$Accuracy >= 0.80) "alta" else if (metricas_globales$Accuracy >= 0.65) "moderada" else "baja"`. Esto indica que el arbol generaliza de forma util en test, aunque conserva zonas de ambiguedad entre categorias cercanas.
+
+##### 6.5.2) Donde se equivoco mas
+
+La confusion mas frecuente fue `r if (nrow(errores_detalle) > 0) paste0("'", error_mas$Clase_real[1], "' -> '", error_mas$Clase_predicha[1], "'") else "ninguna (sin errores observados)"`, con `r if (nrow(errores_detalle) > 0) error_mas$Frecuencia[1] else 0` casos (`r if (nrow(errores_detalle) > 0) round(100 * error_mas$Proporcion_fila[1], 1) else 0`% de la clase real correspondiente).
+
+La clase con menor sensibilidad (*recall*) fue `r clase_peor$Clase[1]` (`r round(100 * clase_peor$Recall[1], 1)`%), lo que sugiere mayor solapamiento de ese segmento con el resto y, por tanto, mayor probabilidad de error en su frontera de decision.
+
+##### 6.5.3) Donde se equivoco menos
+
+La clase mejor identificada fue `r clase_mejor$Clase[1]`, con *recall* de `r round(100 * clase_mejor$Recall[1], 1)`% y precision de `r round(100 * clase_mejor$Precision[1], 1)`%. Este comportamiento se refleja en una mayor concentracion de aciertos sobre la diagonal de la matriz de confusion para dicha categoria.
+
+Este patron sugiere que esa clase presenta una estructura mas separable respecto a las otras, de modo que el arbol puede construir reglas mas estables para reconocerla en datos no vistos.
+
+##### 6.5.4) Importancia de los errores
+
+No todos los errores tienen el mismo peso analitico ni de negocio. En una variable ordenada por nivel de precio (`Economica` < `Intermedia` < `Cara`), confundir clases adyacentes suele ser menos grave que confundir clases extremas.
+
+En esta evaluacion, los errores extremos representan `r round(prop_error_extremo, 1)`% del total de errores. Una proporcion baja de errores extremos implica que el modelo, aun cuando falla, tiende a equivocarse entre categorias vecinas, lo cual mantiene utilidad para segmentacion comercial y recomendacion.
+
+Para SmartStay, esta distincion es relevante: clasificar una propiedad `Cara` como `Intermedia` puede afectar posicionamiento y margen, pero clasificar una `Economica` como `Cara` tiene mayor riesgo de desalinear expectativa de precio y deteriorar la experiencia del usuario.
+
 ---
 
 #### 6.6) Mini-conclusion
@@ -2451,7 +2610,7 @@ La variable categorica `price_cat` queda bien definida: los terciles producen cl
 
 El arbol de clasificacion resultante es interpretable: las divisiones superiores capturan las variables de mayor poder discriminante —capacidad, tipo de alojamiento, ubicacion— y las reglas de decision tienen sentido economico directo. La profundidad controlada y la poda mediante el parametro de complejidad optimo producen un modelo con capacidad de generalizacion razonable, evitando la memorizacion del conjunto de entrenamiento.
 
-Desde una perspectiva de negocio, el modelo es util para clasificar automaticamente nuevas propiedades en segmentos de precio sin necesidad de conocer el precio exacto. Esto puede alimentar sistemas de recomendacion, estrategias de *dynamic pricing* o herramientas de segmentacion de la oferta en plataformas de alquiler vacacional. En la siguiente etapa del laboratorio, el rendimiento del clasificador se evaluara formalmente mediante matriz de confusion, metricas por clase y comparacion contra modelos de mayor complejidad como Random Forest.
+Desde una perspectiva de negocio, el modelo es util para clasificar automaticamente nuevas propiedades en segmentos de precio sin necesidad de conocer el precio exacto. La evaluacion en test mediante matriz de confusion muestra en que clases el arbol es mas robusto, donde concentra sus errores y que tan costosos son esos errores en terminos de decision comercial para SmartStay.
 
 ---
 
