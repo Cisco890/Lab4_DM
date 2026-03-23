@@ -1653,7 +1653,7 @@ modelo_arbol_base <- rpart::rpart(
     cp = 0.001,
     minsplit = 30,
     minbucket = 10,
-    xval = 10
+    xval = 0   # CV explícita se realiza en §11; xval interno es redundante
   )
 )
 
@@ -1803,7 +1803,7 @@ entrenar_arbol_depth <- function(depth, formula, data_train, data_test, response
       cp = 0.001,
       minsplit = 30,
       minbucket = 10,
-      xval = 10
+      xval = 0   # xval interno innecesario; comparación directa contra test_tree
     )
   )
   
@@ -2314,7 +2314,7 @@ arbol_clasif_full <- rpart(
     minsplit  = 30,
     minbucket = 10,
     maxdepth  = 8,
-    xval      = 10
+    xval      = 3    # Reducido de 10; xerror sigue disponible para poda por cp
   )
 )
 
@@ -2640,7 +2640,7 @@ for (cls in names(indices_clase_cv)) {
   }
 }
 
-profundidades_cv <- c(2, 3, 4, 5, 6, 7, 8, 10, 12, 15)
+profundidades_cv <- c(2, 4, 6, 8, 10, 12, 15)
 
 cat("Folds:", k_cv,
     "| Observaciones en train_class:", n_cv,
@@ -2819,7 +2819,7 @@ Se entrena sobre el mismo `train_tree` utilizado en los modelos de arbol de regr
 ```{r rf-config}
 library(randomForest)
 
-n_trees_rf <- 300
+n_trees_rf <- 200
 
 # Excluir factores con mas de 53 niveles (limite de randomForest)
 niveles_fact_rf <- sapply(train_tree, function(x) if (is.factor(x)) nlevels(x) else 0L)
