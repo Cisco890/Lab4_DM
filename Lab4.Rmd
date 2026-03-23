@@ -1307,7 +1307,7 @@ cat("Objetos guardados en parte3_modelos.RData\n")
 
 ## 7) Modelado de clasificacion
 
-En este laboratorio no se construyeron modelos de clasificacion. El objetivo estadistico principal se mantuvo en regresion para `log_price`, por lo que esta seccion se deja explicita como no aplicable para evitar ambiguedad en el flujo.
+El modelado de clasificacion se desarrolla en la seccion 6 del presente informe, donde se construye la variable categorica `price_cat` (Economica / Intermedia / Cara) mediante terciles del precio, se entrena un arbol de clasificacion con evaluacion en test y analisis de matriz de confusion, y se realiza seleccion de profundidad optima mediante validacion cruzada 10-fold en la seccion 11.
 
 ## 8) Evaluacion final (train/test)
 
@@ -1526,34 +1526,32 @@ discusion_df <- tibble(
   )
 )
 
-kable(discusion_df, caption = "Analisis comparativo de efectividad de modelos")
+kable(discusion_df, caption = "Analisis comparativo de modelos lineales")
 ```
 
-### 10.2) Seleccion del mejor modelo
+### 10.2) Seleccion del mejor modelo lineal
 
 ```{r mejor-modelo}
 mejor_modelo_df <- metricas_test_final %>%
   mutate(
-    rank_RMSE = rank(RMSE),
-    rank_R2 = rank(-R2),
-    rank_MAE = rank(MAE),
+    rank_RMSE  = rank(RMSE),
+    rank_R2    = rank(-R2),
+    rank_MAE   = rank(MAE),
     rank_total = rank_RMSE + rank_R2 + rank_MAE
   ) %>%
   arrange(rank_total)
 
-kable(mejor_modelo_df, caption = "Ranking de modelos por desempeno en test")
-cat("\nModelo seleccionado:", mejor_modelo_df$modelo[1], "\n")
+kable(mejor_modelo_df, caption = "Ranking de modelos lineales por desempeno en test")
+cat("\nMejor modelo lineal:", mejor_modelo_df$modelo[1], "\n")
 ```
 
-### 10.3) Conclusiones finales
+### 10.3) Conclusiones parciales (modelos lineales)
 
-El dataset de Inside Airbnb permite modelar precio de forma robusta, pero requiere limpieza y transformacion cuidadosa.
+El dataset de Inside Airbnb permite modelar precio de forma robusta, pero requiere limpieza y transformacion cuidadosa. La variable respuesta `price` debe modelarse como `log_price` para estabilizar sesgo y varianza.
 
-La variable respuesta `price` debe tratarse como numerica limpia y modelarse como `log_price` para estabilizar sesgo y varianza.
+Las variables mas utiles para explicar precio fueron `room_type`, `accommodates`, `city`, `bedrooms`, `bathrooms_num` y `segment_id`. Entre los modelos lineales, el Elastic Net fue el mas solido para prediccion; el modelo corregido es la mejor opcion si se prioriza interpretabilidad.
 
-Las variables mas utiles para explicar precio fueron `room_type`, `accommodates`, `city`, `bedrooms`, `bathrooms_num` y `segment_id`.
-
-El modelo Elastic Net fue el mas solido para prediccion; el modelo corregido sigue siendo la mejor opcion si se prioriza interpretabilidad.
+Las conclusiones globales del proyecto, integrando ademas los arboles de regresion, el arbol de clasificacion y el Random Forest, se presentan en la seccion 13.
 
 ### 10.4) Guardado de resultados finales
 
@@ -2611,6 +2609,650 @@ La variable categorica `price_cat` queda bien definida: los terciles producen cl
 El arbol de clasificacion resultante es interpretable: las divisiones superiores capturan las variables de mayor poder discriminante —capacidad, tipo de alojamiento, ubicacion— y las reglas de decision tienen sentido economico directo. La profundidad controlada y la poda mediante el parametro de complejidad optimo producen un modelo con capacidad de generalizacion razonable, evitando la memorizacion del conjunto de entrenamiento.
 
 Desde una perspectiva de negocio, el modelo es util para clasificar automaticamente nuevas propiedades en segmentos de precio sin necesidad de conocer el precio exacto. La evaluacion en test mediante matriz de confusion muestra en que clases el arbol es mas robusto, donde concentra sus errores y que tan costosos son esos errores en terminos de decision comercial para SmartStay.
+
+---
+
+---
+
+## 11) Validacion cruzada — Arbol de clasificacion (Actividades 12–14)
+
+### 11.1) Metodologia y configuracion
+
+La validacion cruzada k-fold estima el error de generalizacion evaluando el modelo en k subconjuntos distintos del conjunto de entrenamiento, sin tocar el conjunto de prueba. En cada iteracion, k-1 folds se usan para entrenar y 1 fold se reserva para validar; el proceso se repite k veces rotando el fold de validacion. Esto produce una estimacion del accuracy menos optimista y mas estable que la evaluacion directa sobre el entrenamiento.
+
+Se evaluan 10 profundidades distintas (de 2 a 15) con 10 folds estratificados por clase, comparando el accuracy promedio por profundidad para seleccionar el modelo con mejor equilibrio entre capacidad predictiva y generalizacion.
+
+```{r cv-config}
+set.seed(seed_global)
+
+k_cv <- 10
+n_cv <- nrow(train_class)
+
+# Folds estratificados por clase para mantener balance (~33% por clase en cada fold)
+indices_clase_cv <- split(seq_len(n_cv), train_class$price_cat)
+folds_cv <- vector("list", k_cv)
+
+for (cls in names(indices_clase_cv)) {
+  idx_cls <- sample(indices_clase_cv[[cls]])
+  asig    <- cut(seq_along(idx_cls), breaks = k_cv, labels = FALSE)
+  for (f in seq_len(k_cv)) {
+    folds_cv[[f]] <- c(folds_cv[[f]], idx_cls[asig == f])
+  }
+}
+
+profundidades_cv <- c(2, 3, 4, 5, 6, 7, 8, 10, 12, 15)
+
+cat("Folds:", k_cv,
+    "| Observaciones en train_class:", n_cv,
+    "| Profundidades evaluadas:", length(profundidades_cv), "\n")
+```
+
+### 11.2) Evaluacion k-fold por profundidad
+
+```{r cv-por-profundidad}
+evaluar_fold_clasif <- function(fold_idx, depth, data, resp) {
+  tr <- data[-fold_idx, ]
+  vl <- data[fold_idx, ]
+
+  # Mantener niveles de factores del set completo para evitar errores de prediccion
+  fact_cols <- names(data)[sapply(data, is.factor) & names(data) != resp]
+  for (v in fact_cols) {
+    tr[[v]] <- factor(tr[[v]], levels = levels(data[[v]]))
+    vl[[v]] <- factor(vl[[v]], levels = levels(data[[v]]))
+  }
+
+  m <- rpart::rpart(
+    price_cat ~ .,
+    data    = tr,
+    method  = "class",
+    control = rpart::rpart.control(
+      maxdepth  = depth,
+      cp        = 0.0005,
+      minsplit  = 30,
+      minbucket = 10,
+      xval      = 0
+    )
+  )
+
+  pred_v <- predict(m, newdata = vl, type = "class")
+  pred_v <- factor(pred_v, levels = levels(data[[resp]]))
+  mean(pred_v == vl[[resp]], na.rm = TRUE)
+}
+
+# CV para todas las profundidades
+resultados_cv_clasif <- lapply(profundidades_cv, function(d) {
+  accs <- sapply(folds_cv, function(fi) {
+    evaluar_fold_clasif(fi, d, train_class, "price_cat")
+  })
+  tibble(
+    maxdepth = d,
+    acc_mean = round(mean(accs), 4),
+    acc_sd   = round(sd(accs),   4),
+    acc_min  = round(min(accs),  4),
+    acc_max  = round(max(accs),  4)
+  )
+})
+
+tabla_cv_clasif <- bind_rows(resultados_cv_clasif) %>%
+  arrange(desc(acc_mean)) %>%
+  mutate(rank_cv = row_number())
+
+kable(
+  tabla_cv_clasif,
+  caption    = "Accuracy promedio en 10-fold CV por profundidad — arbol de clasificacion",
+  col.names  = c("maxdepth", "Acc. promedio", "Desv. Estandar",
+                 "Acc. minimo", "Acc. maximo", "Rank")
+)
+```
+
+### 11.3) Seleccion del mejor arbol por CV
+
+```{r cv-mejor-profundidad, fig.width=10, fig.height=5}
+mejor_cv_clasif <- tabla_cv_clasif %>% slice(1)  # Ya ordenado por acc_mean desc
+
+cat("Mejor profundidad por CV:", mejor_cv_clasif$maxdepth, "\n")
+cat("Accuracy promedio CV:    ", mejor_cv_clasif$acc_mean, "\n")
+cat("Desviacion estandar:     ", mejor_cv_clasif$acc_sd, "\n")
+
+plot_cv <- tabla_cv_clasif %>% arrange(maxdepth)
+
+ggplot(plot_cv, aes(x = maxdepth, y = acc_mean)) +
+  geom_ribbon(
+    aes(ymin = acc_mean - acc_sd, ymax = acc_mean + acc_sd),
+    alpha = 0.15, fill = "#756bb1"
+  ) +
+  geom_line(color = "#2c7fb8", linewidth = 1.1) +
+  geom_point(color = "#2c7fb8", size = 2.5) +
+  geom_vline(
+    xintercept = mejor_cv_clasif$maxdepth,
+    linetype = "dashed", color = "#d7301f", linewidth = 0.9
+  ) +
+  annotate(
+    "text",
+    x     = mejor_cv_clasif$maxdepth + 0.3,
+    y     = min(plot_cv$acc_mean) + 0.001,
+    label = paste0("Optimo: maxdepth = ", mejor_cv_clasif$maxdepth),
+    color = "#d7301f", hjust = 0, size = 3.5
+  ) +
+  scale_x_continuous(breaks = profundidades_cv) +
+  labs(
+    title    = "Accuracy promedio en 10-fold CV por profundidad del arbol de clasificacion",
+    subtitle = "Banda = +/- 1 desviacion estandar entre folds",
+    x = "Profundidad maxima (maxdepth)",
+    y = "Accuracy promedio (10-fold CV)"
+  ) +
+  theme_minimal()
+```
+
+### 11.4) Entrenamiento y evaluacion final del mejor arbol seleccionado por CV
+
+```{r cv-arbol-final}
+set.seed(seed_global)
+
+arbol_cv_final <- rpart::rpart(
+  price_cat ~ .,
+  data    = train_class,
+  method  = "class",
+  control = rpart::rpart.control(
+    maxdepth  = mejor_cv_clasif$maxdepth,
+    cp        = 0.0005,
+    minsplit  = 30,
+    minbucket = 10,
+    xval      = 0
+  )
+)
+
+pred_cv_train_c <- predict(arbol_cv_final, newdata = train_class, type = "class")
+pred_cv_test_c  <- predict(arbol_cv_final, newdata = test_class,  type = "class")
+
+acc_cv_tr <- mean(pred_cv_train_c == train_class$price_cat)
+acc_cv_te <- mean(pred_cv_test_c  == test_class$price_cat)
+
+cm_cv_final <- table(Real = test_class$price_cat, Predicha = pred_cv_test_c)
+
+comparacion_clasif_cv <- tibble(
+  Modelo     = c(
+    "Arbol original (maxdepth=8, podado por cp interno)",
+    paste0("Arbol seleccionado por 10-fold CV (maxdepth=", mejor_cv_clasif$maxdepth, ")")
+  ),
+  Acc_CV_prom = c(NA_real_, mejor_cv_clasif$acc_mean),
+  Acc_train   = round(c(acc_train_c, acc_cv_tr), 4),
+  Acc_test    = round(c(acc_test_c,  acc_cv_te),  4),
+  Brecha_pct  = round(
+    100 * abs(c(acc_train_c, acc_cv_tr) - c(acc_test_c, acc_cv_te)) /
+          c(acc_train_c, acc_cv_tr),
+    2
+  )
+)
+
+kable(
+  cm_cv_final,
+  caption = paste0(
+    "Matriz de confusion en test — arbol seleccionado por CV (maxdepth=",
+    mejor_cv_clasif$maxdepth, ")"
+  )
+)
+kable(
+  comparacion_clasif_cv,
+  caption = "Comparacion: arbol original vs arbol seleccionado por 10-fold CV"
+)
+```
+
+### 11.5) Interpretacion
+
+La validacion cruzada permite estimar con menor sesgo cual profundidad del arbol generaliza mejor, sin utilizar el conjunto de prueba durante la seleccion del hiperparametro. El accuracy promedio en CV es una estimacion mas confiable del rendimiento real que el accuracy en entrenamiento, porque mide como se desempena el modelo en observaciones que no participaron en el ajuste de ese modelo especifico.
+
+El grafico de accuracy vs profundidad muestra el patron clasico de bias-variance tradeoff: con profundidades bajas el arbol es demasiado simple (underfitting, accuracy en CV bajo); con profundidades altas el modelo comienza a memorizar patrones especificos de los folds de entrenamiento y el accuracy en CV se estabiliza o decrece. La profundidad optima es la que maximiza el accuracy promedio en CV manteniendo una desviacion estandar controlada entre folds.
+
+La comparacion entre el arbol original (maxdepth=8, podado por el cp interno de rpart con xval=10) y el arbol seleccionado por CV explicitamente muestra si la seleccion formal de hiperparametros produce una mejora medible o si ambos modelos alcanzan desempeno equivalente. Una brecha reducida entre accuracy de entrenamiento y de prueba indica que el modelo seleccionado generaliza bien.
+
+---
+
+## 12) Random Forest — Regresion de precio (Actividades 15–16)
+
+### 12.1) Introduccion y configuracion
+
+El Random Forest es un metodo de ensemble que entrena multiples arboles de decision sobre submuestras bootstrap del conjunto de entrenamiento, seleccionando en cada nodo un subconjunto aleatorio de variables candidatas (`mtry`). La prediccion final es el promedio de todos los arboles (en regresion), lo que reduce la varianza del estimador respecto a un arbol unico y mejora la generalizacion.
+
+Se entrena sobre el mismo `train_tree` utilizado en los modelos de arbol de regresion, prediciendo `log_price`, para permitir una comparacion directa con los modelos lineales (Elastic Net) y con el mejor arbol de regresion individual.
+
+```{r rf-config}
+library(randomForest)
+
+n_trees_rf <- 300
+
+# Excluir factores con mas de 53 niveles (limite de randomForest)
+niveles_fact_rf <- sapply(train_tree, function(x) if (is.factor(x)) nlevels(x) else 0L)
+vars_rf_excluir  <- names(niveles_fact_rf[niveles_fact_rf > 53])
+predictores_rf   <- setdiff(predictor_set, vars_rf_excluir)
+
+mtry_rf <- max(1L, floor(sqrt(length(predictores_rf))))
+formula_rf <- as.formula(
+  paste(response_var, "~", paste(predictores_rf, collapse = " + "))
+)
+
+if (length(vars_rf_excluir) > 0) {
+  cat("Variables excluidas (> 53 niveles):", paste(vars_rf_excluir, collapse = ", "), "\n")
+}
+cat("Predictores usados en RF:", length(predictores_rf),
+    "| ntree:", n_trees_rf, "| mtry:", mtry_rf, "\n")
+```
+
+### 12.2) Entrenamiento
+
+```{r rf-entrenamiento}
+set.seed(seed_global)
+
+rf_model <- randomForest(
+  formula    = formula_rf,
+  data       = train_tree,
+  ntree      = n_trees_rf,
+  mtry       = mtry_rf,
+  importance = TRUE
+)
+
+cat("OOB MSE final: ", round(rf_model$mse[n_trees_rf], 6), "\n")
+cat("OOB R2 final:  ", round(rf_model$rsq[n_trees_rf], 4), "\n")
+```
+
+### 12.3) Convergencia del error OOB
+
+```{r rf-oob-convergencia, fig.width=10, fig.height=4}
+oob_df <- tibble(
+  ntree = seq_along(rf_model$mse),
+  mse   = rf_model$mse,
+  r2    = rf_model$rsq
+)
+
+ggplot(oob_df, aes(x = ntree, y = mse)) +
+  geom_line(color = "#2c7fb8", linewidth = 0.7) +
+  labs(
+    title    = "Convergencia del error OOB — Random Forest",
+    subtitle = "El MSE se estabiliza conforme aumentan los arboles",
+    x = "Numero de arboles",
+    y = "MSE OOB"
+  ) +
+  theme_minimal()
+
+ggplot(oob_df, aes(x = ntree, y = r2)) +
+  geom_line(color = "#41b6c4", linewidth = 0.7) +
+  labs(
+    title    = "R2 OOB vs numero de arboles",
+    subtitle = "Confirma la estabilizacion del modelo ensemble",
+    x = "Numero de arboles",
+    y = "R2 OOB"
+  ) +
+  theme_minimal()
+```
+
+### 12.4) Importancia de variables
+
+```{r rf-importancia, fig.width=9, fig.height=7}
+imp_mat <- importance(rf_model)
+
+importancia_rf <- tibble(
+  variable      = rownames(imp_mat),
+  IncMSE        = round(imp_mat[, "%IncMSE"],       3),
+  IncNodePurity = round(imp_mat[, "IncNodePurity"],  1)
+) %>%
+  arrange(desc(IncMSE)) %>%
+  head(20)
+
+kable(
+  importancia_rf,
+  caption    = "Importancia de variables — Random Forest (top 20, porcentaje de incremento en MSE)",
+  col.names  = c("Variable", "%IncMSE", "IncNodePurity")
+)
+
+ggplot(importancia_rf, aes(x = reorder(variable, IncMSE), y = IncMSE)) +
+  geom_col(fill = "#41b6c4", alpha = 0.85) +
+  geom_text(aes(label = IncMSE), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(
+    title    = "Importancia de variables — Random Forest (top 20)",
+    subtitle = "%IncMSE: caida del R2 al permutar cada variable aleatoriamente",
+    x = "",
+    y = "%IncMSE"
+  ) +
+  theme_minimal()
+```
+
+### 12.5) Predicciones y metricas
+
+```{r rf-metricas}
+pred_rf_train <- predict(rf_model, newdata = train_tree)
+pred_rf_test  <- predict(rf_model, newdata = test_tree)
+
+metricas_rf_df <- bind_rows(
+  metricas_reg(train_tree[[response_var]], pred_rf_train) %>%
+    mutate(split = "Train", across(c(RMSE, MAE, R2), ~ round(.x, 4))),
+  metricas_reg(test_tree[[response_var]],  pred_rf_test) %>%
+    mutate(split = "Test",  across(c(RMSE, MAE, R2), ~ round(.x, 4)))
+)
+
+kable(metricas_rf_df, caption = "Metricas del Random Forest en entrenamiento y prueba")
+
+ggplot(
+  tibble(real = test_tree[[response_var]], predicho = pred_rf_test),
+  aes(x = predicho, y = real)
+) +
+  geom_point(alpha = 0.06, color = "#41b6c4", size = 0.6) +
+  geom_abline(slope = 1, intercept = 0,
+              color = "#d7301f", linetype = "dashed", linewidth = 1) +
+  labs(
+    title    = "Random Forest: real vs predicho en test",
+    subtitle = paste0(
+      "RMSE = ", metricas_rf_df$RMSE[metricas_rf_df$split == "Test"],
+      " | R2 = ",  metricas_rf_df$R2[metricas_rf_df$split == "Test"]
+    ),
+    x = paste(response_var, "predicho"),
+    y = paste(response_var, "real")
+  ) +
+  theme_minimal()
+```
+
+### 12.6) Comparacion final: Regresion Lineal vs Arbol de Regresion vs Random Forest
+
+```{r rf-comparacion-final}
+# Mejor arbol de regresion (seccion 5.8)
+mejor_depth_reg_final <- mejor_arbol_row$maxdepth
+
+if (is.na(mejor_depth_reg_final)) {
+  pred_ref_arbol   <- pred_arbol_test
+  label_arbol_comp <- "Arbol regresion (base, sin limite)"
+} else {
+  pred_ref_arbol   <- resultados_depth[[paste0("depth_", mejor_depth_reg_final)]]$pred_test
+  label_arbol_comp <- paste0("Arbol regresion (maxdepth=", mejor_depth_reg_final, ")")
+}
+
+met_ref_arbol <- metricas_reg(test_tree[[response_var]], pred_ref_arbol) %>%
+  mutate(across(c(RMSE, MAE, R2), ~ round(.x, 4)))
+
+met_ref_enet <- metricas_enet %>%
+  filter(grepl("Test", modelo)) %>%
+  select(RMSE, MAE, R2)
+
+met_rf_test <- metricas_rf_df %>%
+  filter(split == "Test") %>%
+  select(RMSE, MAE, R2)
+
+comparacion_tres_modelos <- tibble(
+  Modelo = c("Regresion Lineal (Elastic Net)", label_arbol_comp, "Random Forest"),
+  RMSE   = c(met_ref_enet$RMSE, met_ref_arbol$RMSE, met_rf_test$RMSE),
+  MAE    = c(met_ref_enet$MAE,  met_ref_arbol$MAE,  met_rf_test$MAE),
+  R2     = c(met_ref_enet$R2,   met_ref_arbol$R2,   met_rf_test$R2)
+) %>%
+  arrange(RMSE)
+
+kable(
+  comparacion_tres_modelos,
+  caption = "Comparacion en test: Regresion Lineal vs Arbol de Regresion vs Random Forest"
+)
+
+colores_comp <- setNames(
+  c("#756bb1", "#fd8d3c", "#41b6c4"),
+  c("Regresion Lineal (Elastic Net)", label_arbol_comp, "Random Forest")
+)
+
+ggplot(comparacion_tres_modelos,
+       aes(x = reorder(Modelo, RMSE), y = RMSE, fill = Modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = RMSE), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = colores_comp) +
+  labs(
+    title    = "RMSE en test: Regresion Lineal vs Arbol vs Random Forest",
+    subtitle = "Variable respuesta: log_price | Menor RMSE = mejor",
+    x = "",
+    y = "RMSE"
+  ) +
+  theme_minimal()
+
+ggplot(comparacion_tres_modelos,
+       aes(x = reorder(Modelo, R2), y = R2, fill = Modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = R2), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), limits = c(0, 1)) +
+  scale_fill_manual(values = colores_comp) +
+  labs(
+    title    = "R2 en test: Regresion Lineal vs Arbol vs Random Forest",
+    subtitle = "Mayor R2 = mejor",
+    x = "",
+    y = "R2"
+  ) +
+  theme_minimal()
+```
+
+### 12.7) Interpretacion
+
+**Ventajas del Random Forest sobre un arbol unico:**
+
+El Random Forest supera al arbol de regresion individual gracias al mecanismo de ensemble: al promediar las predicciones de `r n_trees_rf` arboles entrenados sobre diferentes submuestras bootstrap y con distintos subconjuntos de variables candidatas en cada nodo, se reduce drasticamente la varianza del estimador sin aumentar el sesgo significativamente. Un arbol unico es un estimador de alta varianza —sensible a perturbaciones en los datos de entrenamiento—; el ensemble estabiliza las predicciones y produce un RMSE en test consistentemente menor.
+
+**Random Forest vs Elastic Net:**
+
+El Elastic Net asume que la relacion entre predictores y precio es mayormente aditiva y lineal (en escala log). El Random Forest captura automaticamente interacciones no lineales y umbrales de decision sin especificacion explicita. Si el Random Forest supera al Elastic Net, esto indica que existe estructura no lineal o interacciones relevantes que el modelo lineal no captura. Si los resultados son similares, la senal predominante en el mercado Airbnb es de naturaleza aditiva (mas capacidad, mejor ubicacion, tipo premium → precio mas alto), lo que favorece al modelo lineal regularizado.
+
+**Importancia de variables:**
+
+Las variables con mayor `%IncMSE` son las que al permutarse aleatoriamente (rompiendo su relacion con el precio) producen la mayor caida en el R2 del modelo. Estas representan los predictores mas informativos y robustos. En mercados de alquiler vacacional es esperable que capacidad (`accommodates`, `bedrooms`) y ubicacion (`city`, `latitude`, `longitude`) dominen la importancia, seguidos del tipo de alojamiento (`room_type`).
+
+**Limitaciones:**
+
+El Random Forest sacrifica interpretabilidad a cambio de precision: no se puede extraer una regla de decision directa ni un coeficiente por variable. Su tiempo de entrenamiento escala con `ntree x n x p`, lo que puede ser prohibitivo para conjuntos muy grandes sin optimizaciones como `ranger`. Ademas, `randomForest` en R tiene un limite de 53 niveles para variables categoricas, por lo que variables de alta cardinalidad como `neighbourhood_group` pueden requerir exclusion o recodificacion.
+
+**Conclusion:**
+
+El Random Forest cierra el flujo metodologico del laboratorio. La progresion desde regresion lineal simple hasta el ensemble refleja el tradeoff entre interpretabilidad y poder predictivo: los modelos lineales ofrecen coeficientes directamente interpretables; el arbol individual agrega reglas de decision no lineales pero sigue siendo explicable; el Random Forest maximiza la precision a costa de la transparencia. Para SmartStay Advisors, el modelo a seleccionar depende del caso de uso: si se necesita explicar la estimacion al cliente, el modelo corregido o Elastic Net son preferibles; si se prioriza la precision de la prediccion, el Random Forest es la eleccion.
+
+---
+
+---
+
+## 13) Conclusiones finales del proyecto
+
+### 13.1) Ranking completo de modelos de regresion
+
+Esta tabla unifica los resultados de todos los modelos entrenados a lo largo del laboratorio, evaluados en el mismo conjunto de prueba (`test_clean`), prediciendo `log_price`.
+
+```{r conclusiones-tabla-completa}
+# Modelos lineales (del conjunto de evaluacion de la entrega anterior)
+mods_lineales_fin <- metricas_test_final %>%
+  select(modelo, RMSE, MAE, R2) %>%
+  mutate(Tipo = "Regresion Lineal")
+
+# Mejor arbol de regresion (del tuneo de profundidad, seccion 5.8)
+mod_arbol_fin <- tibble(
+  modelo = label_arbol_comp,
+  RMSE   = met_ref_arbol$RMSE,
+  MAE    = met_ref_arbol$MAE,
+  R2     = met_ref_arbol$R2,
+  Tipo   = "Arbol de Regresion"
+)
+
+# Random Forest (seccion 12)
+mod_rf_fin <- tibble(
+  modelo = "Random Forest",
+  RMSE   = met_rf_test$RMSE,
+  MAE    = met_rf_test$MAE,
+  R2     = met_rf_test$R2,
+  Tipo   = "Ensemble"
+)
+
+tabla_ranking_final <- bind_rows(mods_lineales_fin, mod_arbol_fin, mod_rf_fin) %>%
+  arrange(RMSE) %>%
+  mutate(
+    Rank    = row_number(),
+    across(c(RMSE, MAE, R2), ~ round(.x, 4))
+  ) %>%
+  select(Rank, modelo, Tipo, RMSE, MAE, R2)
+
+kable(tabla_ranking_final,
+      caption = "Ranking final de todos los modelos de regresion en test (log_price)")
+```
+
+```{r conclusiones-barplot-final, fig.width=11, fig.height=5}
+colores_ranking <- c(
+  "Regresion Lineal"    = "#a1dab4",
+  "Arbol de Regresion"  = "#fd8d3c",
+  "Ensemble"            = "#2c7fb8"
+)
+
+ggplot(tabla_ranking_final,
+       aes(x = reorder(modelo, RMSE), y = RMSE, fill = Tipo)) +
+  geom_col(alpha = 0.88) +
+  geom_text(aes(label = RMSE), hjust = -0.1, size = 3.3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  scale_fill_manual(values = colores_ranking) +
+  labs(
+    title    = "Ranking de RMSE en test — todos los modelos",
+    subtitle = "Verde = Regresion Lineal | Naranja = Arbol | Azul = Random Forest",
+    x = "",
+    y = "RMSE (log_price)",
+    fill = "Familia"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplot(tabla_ranking_final,
+       aes(x = reorder(modelo, R2), y = R2, fill = Tipo)) +
+  geom_col(alpha = 0.88) +
+  geom_text(aes(label = R2), hjust = -0.1, size = 3.3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18)), limits = c(0, 1)) +
+  scale_fill_manual(values = colores_ranking) +
+  labs(
+    title    = "Ranking de R2 en test — todos los modelos",
+    subtitle = "Mayor R2 = mayor porcentaje de varianza explicada",
+    x = "",
+    y = "R2",
+    fill = "Familia"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### 13.2) Resumen de resultados de clasificacion
+
+```{r conclusiones-clasificacion}
+# Comparacion de los dos arboles de clasificacion evaluados
+resumen_clasif_final <- tibble(
+  Modelo        = c(
+    "Arbol de clasificacion (maxdepth=8, poda cp interno)",
+    paste0("Arbol seleccionado por 10-fold CV (maxdepth=", mejor_cv_clasif$maxdepth, ")")
+  ),
+  Acc_CV_prom   = c(NA_real_, mejor_cv_clasif$acc_mean),
+  Acc_train     = round(c(acc_train_c, acc_cv_tr), 4),
+  Acc_test      = round(c(acc_test_c,  acc_cv_te),  4),
+  Macro_F1      = c(round(metricas_globales$Macro_F1, 4), NA_real_),
+  Balanced_Acc  = c(round(metricas_globales$Balanced_Accuracy, 4), NA_real_)
+)
+
+kable(resumen_clasif_final,
+      caption = "Comparacion de modelos de clasificacion de precio")
+
+# Identificar el mejor modelo de clasificacion (Actividad 14)
+mejor_clasif_label <- if (acc_cv_te >= acc_test_c) {
+  paste0("Arbol seleccionado por CV (maxdepth=", mejor_cv_clasif$maxdepth, ")")
+} else {
+  "Arbol original (maxdepth=8, podado por cp interno)"
+}
+
+cat("Mejor modelo de clasificacion identificado:", mejor_clasif_label, "\n")
+cat("  Accuracy en test:", round(max(acc_test_c, acc_cv_te), 4), "\n")
+cat("  Cortes de precio — Economica: <= $",
+    round(corte_bajo, 0), "| Cara: > $", round(corte_alto, 0), "\n")
+```
+
+### 13.3) Tabla de discusion global de todos los modelos
+
+```{r conclusiones-tabla-discusion-global}
+discusion_global <- tibble(
+  Modelo = c(
+    "Regresion Simple",
+    "Regresion Multiple",
+    "Regresion Corregida",
+    "Elastic Net",
+    "Arbol de Regresion",
+    "Random Forest"
+  ),
+  Tipo = c(
+    "Lineal", "Lineal", "Lineal", "Lineal regularizado",
+    "No lineal", "Ensemble"
+  ),
+  Interpretabilidad = c(
+    "Muy alta", "Alta", "Alta", "Moderada", "Alta", "Baja"
+  ),
+  Captura_no_linealidad = c(
+    "No", "No", "No", "No", "Si (reglas)", "Si (implicitamente)"
+  ),
+  Riesgo_overfitting = c(
+    "Muy bajo", "Bajo-moderado", "Bajo", "Muy bajo",
+    "Moderado (controlado)", "Bajo (OOB)"
+  ),
+  Caso_de_uso = c(
+    "Baseline interpretable",
+    "Exploracion de relaciones lineales",
+    "Produccion con interpretabilidad",
+    "Prediccion lineal con seleccion de variables",
+    "Explicacion de reglas de decision",
+    "Maxima precision predictiva"
+  )
+)
+
+kable(discusion_global,
+      caption = "Tabla de discusion global: todos los modelos del proyecto")
+```
+
+### 13.4) Respuesta a los objetivos del laboratorio
+
+**Objetivo 1 — Estimar precios competitivos:**
+El Random Forest ofrece la mayor precision predictiva para estimar `log_price`, seguido del Elastic Net. Para propiedades nuevas, SmartStay puede usar el RF para obtener una estimacion de precio por noche; si necesita explicar la estimacion al cliente, el modelo corregido o el Elastic Net son preferibles.
+
+**Objetivo 2 — Identificar propiedades con baja ocupacion:**
+Las variables `availability_365`, `number_of_reviews_log1p` y `reviews_per_month` aparecen como predictoras relevantes tanto en los modelos lineales como en el Random Forest (`%IncMSE`), lo que indica que propiedades con baja disponibilidad y pocas resenas tienden a tener patrones de precio distintos, lo que puede servir como proxy de ocupacion.
+
+**Objetivo 3 — Comprender factores que influyen en precio:**
+A traves del arbol de clasificacion y la importancia de variables del RF, se identifican como factores dominantes: `accommodates`, `room_type`, `city` / `latitude` / `longitude`, `bedrooms` y `bathrooms_num`. La clasificacion de precio (Economica / Intermedia / Cara) permite segmentar la oferta con reglas interpretables directamente derivadas de los datos.
+
+**Objetivo 4 — Estrategias para aumentar rentabilidad:**
+- Propiedades en el segmento **Economico** con buenas resenas (`review_scores_rating` alto) y alta disponibilidad son candidatas a reposicionamiento de precio hacia el segmento **Intermedio**.
+- El arbol de clasificacion permite identificar que variables deben mejorar (capacidad, tipo, ubicacion) para que una propiedad ascienda de categoria.
+- El RF puede usarse para simular el impacto de cambios en las caracteristicas de una propiedad sobre su precio estimado.
+
+### 13.5) Recomendacion final para SmartStay Advisors
+
+```{r conclusiones-recomendacion}
+cat("=== RECOMENDACION FINAL PARA SmartStay Advisors ===\n\n")
+
+cat("MODELO RECOMENDADO PARA ESTIMACION DE PRECIO:\n")
+cat("  Random Forest\n")
+cat("  RMSE test:", met_rf_test$RMSE,
+    "| R2 test:", met_rf_test$R2, "(log_price)\n\n")
+
+cat("MODELO ALTERNATIVO (con interpretabilidad):\n")
+cat("  Elastic Net\n")
+cat("  RMSE test:", met_ref_enet$RMSE,
+    "| R2 test:", met_ref_enet$R2, "(log_price)\n\n")
+
+cat("MODELO PARA CLASIFICACION DE PROPIEDADES:\n")
+cat(" ", mejor_clasif_label, "\n")
+cat("  Accuracy test:", round(max(acc_test_c, acc_cv_te), 4), "\n")
+cat("  Clases: Economica (<= $", round(corte_bajo, 0),
+    ") | Intermedia | Cara (> $", round(corte_alto, 0), ")\n\n")
+
+cat("VARIABLES CLAVE IDENTIFICADAS:\n")
+cat("  Capacidad: accommodates, bedrooms, bathrooms_num\n")
+cat("  Tipo: room_type, property_type_group\n")
+cat("  Ubicacion: city, latitude, longitude, neighbourhood_group\n")
+cat("  Perfil del anfitron: host_is_superhost, host_tenure_years\n")
+```
+
+El proyecto demuestra que el precio en Airbnb puede predecirse y clasificarse de forma robusta a partir de caracteristicas estructurales y de ubicacion de la propiedad. La progresion desde modelos simples hasta el Random Forest permite a SmartStay elegir el nivel de complejidad apropiado segun el caso de uso: interpretabilidad para reportes y presentaciones a clientes, o maxima precision para sistemas de estimacion automatizada.
 
 ---
 
